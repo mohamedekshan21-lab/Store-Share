@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Expo Provider Portal — Storage Node Monitoring & Management</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+  <!-- Header / Nav -->
+  <header class="app-header">
+    <div class="header-left">
+      <div class="logo-badge">
+        <span class="logo-icon">🪐</span>
+        <span class="logo-title">EXPO</span>
+        <span class="logo-sub">PROVIDER PORTAL</span>
+      </div>
+      <div class="header-status">
+        <span class="status-dot pulse-green"></span>
+        <span class="status-label">Coordinator Connected</span>
+      </div>
+    </div>
+    <div class="header-right">
+      <div class="provider-pill">
+        <span class="provider-icon">👤</span>
+        <span class="provider-label">Provider:</span>
+        <span id="current-provider-id" class="provider-val">default_provider</span>
+      </div>
+      <div class="window-selector">
+        <label for="window-select">Window:</label>
+        <select id="window-select" aria-label="Select evaluation window">
+          <option value="24" selected>Last 24 Hours</option>
+          <option value="168">Last 7 Days</option>
+          <option value="720">Last 30 Days</option>
+        </select>
+      </div>
+      <button id="refresh-btn" class="btn btn-outline" title="Refresh Dashboard">
+        <span class="refresh-icon">↻</span> Refresh
+      </button>
+      <button id="auth-btn" class="btn btn-primary" title="Sign In or Switch Provider">
+        Sign In
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Container -->
+  <main class="dashboard-container">
+    <!-- Notice / Alert Banner (Stale Nodes or Offline) -->
+    <div id="stale-alert-banner" class="alert-banner warning-banner" style="display: none;">
+      <span class="alert-icon">⚠️</span>
+      <div class="alert-content">
+        <strong id="stale-alert-title">Stale Heartbeat Warning:</strong>
+        <span id="stale-alert-desc">One or more storage nodes have not reported recent heartbeats.</span>
+      </div>
+    </div>
+
+    <!-- Error State Container -->
+    <div id="error-container" class="card error-card" style="display: none;">
+      <div class="error-icon">❌</div>
+      <div class="error-title">Unable to Load Provider Data</div>
+      <div id="error-message" class="error-desc">Could not reach the Expo Coordinator. Please check authentication and network connectivity.</div>
+      <button id="retry-btn" class="btn btn-primary">Retry Connection</button>
+    </div>
+
+    <!-- Loading State Skeleton -->
+    <div id="loading-container" class="loading-wrapper">
+      <div class="spinner"></div>
+      <p class="loading-text">Loading provider metrics and node health...</p>
+    </div>
+
+    <!-- Main Content (Populated on Load) -->
+    <div id="dashboard-content" style="display: none;">
+      <!-- Hero Overview Grid -->
+      <section class="overview-grid" aria-label="Provider Overview Summary">
+        <!-- Card 1: Storage Quota & Verified Data -->
+        <div class="card metric-card" id="card-storage">
+          <div class="card-header">
+            <div class="card-title-group">
+              <span class="metric-icon cyan-glow">💾</span>
+              <span class="card-title">Storage Allocation</span>
+            </div>
+            <span class="badge badge-cyan">Active Files</span>
+          </div>
+          <div class="metric-body">
+            <div class="hero-number-group">
+              <span id="verified-stored-bytes" class="hero-number">—</span>
+              <span class="hero-unit">Verified Stored Data</span>
+            </div>
+            <div class="storage-progress-wrapper">
+              <div class="progress-bar-bg">
+                <div id="storage-progress-fill" class="progress-bar-fill cyan-fill" style="width: 0%;"></div>
+              </div>
+              <div class="progress-labels">
+                <span>Configured Quota: <strong id="configured-quota-bytes">—</strong></span>
+                <span>Remaining: <strong id="remaining-quota-bytes">—</strong></span>
+              </div>
+            </div>
+            <div class="disk-meta-box">
+              <span class="meta-label">Physical Host Disk:</span>
+              <span id="physical-disk-stats" class="meta-value">Not reported by provider</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Card 2: Bandwidth & Traffic -->
+        <div class="card metric-card" id="card-traffic">
+          <div class="card-header">
+            <div class="card-title-group">
+              <span class="metric-icon violet-glow">⚡</span>
+              <span class="card-title">Bandwidth & Traffic</span>
+            </div>
+            <span class="badge badge-violet" id="traffic-window-badge">24h Window</span>
+          </div>
+          <div class="metric-body">
+            <div class="hero-number-group">
+              <span id="total-traffic-bytes" class="hero-number">—</span>
+              <span class="hero-unit">Total Payload Transferred</span>
+            </div>
+            <div class="split-stats-grid">
+              <div class="split-stat">
+                <span class="split-label">▲ Client Ingress (Upload)</span>
+                <span id="total-ingress-bytes" class="split-val cyan-text">—</span>
+              </div>
+              <div class="split-stat">
+                <span class="split-label">▼ Client Egress (Download)</span>
+                <span id="total-egress-bytes" class="split-val violet-text">—</span>
+              </div>
+            </div>
+            <div class="disk-meta-box">
+              <span class="meta-label">Transfer Ratio:</span>
+              <span id="traffic-ratio-text" class="meta-value">—</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Card 3: Contribution Credits (ECC) -->
+        <div class="card metric-card" id="card-credits">
+          <div class="card-header">
+            <div class="card-title-group">
+              <span class="metric-icon emerald-glow">💎</span>
+              <span class="card-title">Contribution Credits (ECC)</span>
+            </div>
+            <span class="badge badge-emerald">Fixed Precision (10⁻⁶)</span>
+          </div>
+          <div class="metric-body">
+            <div class="hero-number-group">
+              <span id="total-credits-balance" class="hero-number emerald-text">—</span>
+              <span class="hero-unit">Current Reconciled Balance</span>
+            </div>
+            <div class="split-stats-grid">
+              <div class="split-stat">
+                <span class="split-label">Lifetime Earned</span>
+                <span id="total-lifetime-earned" class="split-val emerald-text">—</span>
+              </div>
+              <div class="split-stat">
+                <span class="split-label">Lifetime Reversed</span>
+                <span id="total-lifetime-reversed" class="split-val rose-text">—</span>
+              </div>
+            </div>
+            <div class="disk-meta-box">
+              <span class="meta-label">Ledger Integrity:</span>
+              <span class="meta-value text-emerald">Reconciled to Micro-Units</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Card 4: Trust & Reputation -->
+        <div class="card metric-card" id="card-reputation">
+          <div class="card-header">
+            <div class="card-title-group">
+              <span class="metric-icon amber-glow">🛡️</span>
+              <span class="card-title">Node Reputation</span>
+            </div>
+            <span id="reputation-confidence-badge" class="badge badge-amber">Evaluating...</span>
+          </div>
+          <div class="metric-body">
+            <div class="hero-number-group">
+              <span id="average-reputation-score" class="hero-number amber-text">—</span>
+              <span class="hero-unit">Average Score (0 – 100)</span>
+            </div>
+            <div class="split-stats-grid">
+              <div class="split-stat">
+                <span class="split-label">Successful Repairs</span>
+                <span id="recent-succ-repairs" class="split-val emerald-text">—</span>
+              </div>
+              <div class="split-stat">
+                <span class="split-label">Failed Repairs</span>
+                <span id="recent-fail-repairs" class="split-val rose-text">—</span>
+              </div>
+            </div>
+            <div class="disk-meta-box">
+              <span class="meta-label">Prior Calibration:</span>
+              <span class="meta-value">Unobserved Dimensions = 50.0</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Charts & Visualizations -->
+      <section class="charts-section">
+        <div class="card chart-card">
+          <div class="card-header">
+            <span class="card-title">Storage Allocation & Data Occupancy</span>
+            <span class="card-subtitle">Verified Stored Bytes vs Configured Quota</span>
+          </div>
+          <div id="storage-chart-container" class="chart-container">
+            <!-- Inline SVG Chart -->
+          </div>
+        </div>
+
+        <div class="card chart-card">
+          <div class="card-header">
+            <span class="card-title">Bandwidth Transfer Breakdown</span>
+            <span class="card-subtitle">Ingress (Client Upload) vs Egress (Client Download)</span>
+          </div>
+          <div id="traffic-chart-container" class="chart-container">
+            <!-- Inline SVG Chart -->
+          </div>
+        </div>
+      </section>
+
+      <!-- Registered Nodes Table -->
+      <section class="nodes-section">
+        <div class="card table-card">
+          <div class="card-header table-header">
+            <div>
+              <h2 class="card-title">Registered Storage Nodes</h2>
+              <span class="card-subtitle" id="nodes-count-subtitle">0 nodes registered</span>
+            </div>
+            <div class="table-actions">
+              <input type="text" id="node-search-input" placeholder="Search Node ID or Host..." class="search-input" aria-label="Search nodes">
+            </div>
+          </div>
+
+          <!-- Empty State (No Nodes) -->
+          <div id="empty-nodes-container" class="empty-state" style="display: none;">
+            <span class="empty-icon">📦</span>
+            <h3>No Storage Nodes Registered</h3>
+            <p>You have not registered any Storage Nodes under this provider account yet. Start your Storage Node daemon to connect to the Coordinator.</p>
+          </div>
+
+          <!-- Table Container -->
+          <div class="table-responsive">
+            <table class="nodes-table" id="nodes-table" aria-label="Storage nodes table">
+              <thead>
+                <tr>
+                  <th>Node ID</th>
+                  <th>Status</th>
+                  <th>Mode</th>
+                  <th>Verified / Quota</th>
+                  <th>Availability</th>
+                  <th>Reputation</th>
+                  <th>Credits</th>
+                  <th>Scheduling</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="nodes-table-body">
+                <!-- Dynamically generated rows -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- Recent Operational Activity Stream -->
+      <section class="activity-section">
+        <div class="card activity-card">
+          <div class="card-header">
+            <h2 class="card-title">Recent Activity & Audit Stream</h2>
+            <span class="card-subtitle">Verified Chunk Transfers, Repair Jobs & Ledger Accruals</span>
+          </div>
+          <div id="activity-stream-list" class="activity-list">
+            <!-- Dynamically generated activity items -->
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <!-- Node Detail Drilldown Modal -->
+  <div id="node-modal" class="modal-backdrop" style="display: none;" role="dialog" aria-modal="true" aria-labelledby="modal-node-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h2 id="modal-node-title" class="modal-title">Node Diagnostics: NODE-1</h2>
+          <span id="modal-node-endpoint" class="modal-subtitle">http://127.0.0.1:8000</span>
+        </div>
+        <button id="modal-close-btn" class="modal-close" aria-label="Close dialog">&times;</button>
+      </div>
+      <div class="modal-body" id="modal-body-content">
+        <!-- Dynamically injected diagnostics -->
+      </div>
+      <div class="modal-footer">
+        <button id="modal-drain-btn" class="btn btn-warning">Initiate Graceful Drain</button>
+        <button id="modal-dismiss-btn" class="btn btn-outline">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Provider Authentication Modal -->
+  <div id="login-modal" class="modal-backdrop" style="display: none;" role="dialog" aria-modal="true" aria-labelledby="login-modal-title">
+    <div class="modal-card" style="max-width: 420px;">
+      <div class="modal-header">
+        <div>
+          <h2 id="login-modal-title" class="modal-title">Provider Sign In</h2>
+          <span class="modal-subtitle">Authenticate session with Coordinator credentials</span>
+        </div>
+        <button id="login-close-btn" class="modal-close" aria-label="Close dialog">&times;</button>
+      </div>
+      <div class="modal-body">
+        <form id="login-form" onsubmit="return false;" style="display: flex; flex-direction: column; gap: 1rem;">
+          <div>
+            <label for="login-provider-id" style="display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 0.4rem; color: var(--text-secondary);">Provider ID</label>
+            <input id="login-provider-id" type="text" placeholder="e.g. provider_1 or admin" required class="search-input" style="width: 100%;">
+          </div>
+          <div>
+            <label for="login-secret" style="display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 0.4rem; color: var(--text-secondary);">Secret / Auth Token</label>
+            <input id="login-secret" type="password" placeholder="Coordinator token or secret" required class="search-input" style="width: 100%;">
+          </div>
+          <div id="login-error-msg" style="color: var(--accent-rose); font-size: 0.85rem; display: none;"></div>
+          <button id="login-submit-btn" type="submit" class="btn btn-primary" style="margin-top: 0.5rem; justify-content: center;">Authenticate</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <footer class="app-footer">
+    <p>Expo Distributed Storage Engine &bull; Phase 8B Provider Security &amp; Safe Lifecycle &bull; Zero-Knowledge Client-Side AES-256-GCM Architecture</p>
+  </footer>
+
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>

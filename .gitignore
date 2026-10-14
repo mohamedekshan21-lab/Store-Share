@@ -1,0 +1,27 @@
+# Storage Node Sandbox & Databases
+storage/
+**/storage/*
+!**/storage/.gitkeep
+*.db
+*.sqlite3
+
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment Variables & Secrets
+.env
+.env.local
+
+# Editor & OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
