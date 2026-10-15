@@ -27,7 +27,17 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
-import zfec.easyfec
+try:
+    import zfec.easyfec
+except ImportError:
+    import sys
+    import types
+    import client._pure_zfec as _pure_easyfec
+    _zfec_pkg = types.ModuleType("zfec")
+    _zfec_pkg.easyfec = _pure_easyfec
+    sys.modules["zfec"] = _zfec_pkg
+    sys.modules["zfec.easyfec"] = _pure_easyfec
+    import zfec.easyfec
 
 logger = logging.getLogger("expo_erasure")
 

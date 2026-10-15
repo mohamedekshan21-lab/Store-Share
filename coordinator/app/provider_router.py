@@ -117,15 +117,17 @@ def get_current_principal(
     x_provider_id: Optional[str] = Header(None, alias="X-Provider-Id"),
     x_admin_override: Optional[str] = Header(None, alias="X-Admin-Override"),
     session_cookie: Optional[str] = Cookie(None, alias="expo_session"),
+    expo_jwt_cookie: Optional[str] = Cookie(None, alias="expo_jwt"),
     x_csrf_token: Optional[str] = Header(None, alias="X-CSRF-Token"),
 ) -> AuthenticatedPrincipal:
     """
-    Resolves and verifies the security principal from Bearer tokens or browser session cookies.
+    Resolves and verifies the security principal from Bearer tokens, JWT tokens, or browser session cookies.
     Prevents untrusted X-Provider-Id spoofing:
     - Master/Admin token is authorized to specify provider context.
     - Non-admin principals can only access their own provider identity.
     - Explicit X-Admin-Override is required for cross-provider node mutations.
     - Session-authenticated state mutations require a valid CSRF token.
+    - Human users with CONSUMER role are forbidden from provider management.
     """
     settings = (
         request.app.state.settings
@@ -144,9 +146,65 @@ def get_current_principal(
         token = x_auth_token.strip()
     elif authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
+    elif expo_jwt_cookie and expo_jwt_cookie.strip():
+        token = expo_jwt_cookie.strip()
 
     if token:
-        # 1a. Explicit database credential check
+        # 1a. Check for signed JWT human user authentication token
+        if token.count(".") == 2:
+            try:
+                from coordinator.app.user_auth import decode_access_token, get_user_manager, Role
+                user_manager = get_user_manager(request)
+                payload = decode_access_token(token, settings)
+                jti = payload.get("jti")
+                user_id = payload.get("sub")
+                if user_manager.is_token_revoked(jti):
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Unauthorized: Token has been revoked.",
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+                user = user_manager.get_user_by_id(user_id)
+                if not user or not user.is_active or user.role_version != payload.get("role_version", 1):
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Unauthorized: User account inactive or privileges revoked.",
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+
+                if user.role == Role.CONSUMER.value:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Forbidden: Consumer accounts cannot access provider management functions.",
+                    )
+
+                is_admin = (user.role == Role.ADMIN.value)
+                user_provider = user.provider_id or "default_provider"
+
+                if x_provider_id and x_provider_id.strip():
+                    req_prov = x_provider_id.strip()
+                    if not is_admin and req_prov != user.provider_id:
+                        raise HTTPException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            detail=f"Access denied: User '{user.username}' is not authorized to act as provider '{req_prov}'.",
+                        )
+                    target_provider = req_prov
+                else:
+                    target_provider = user_provider if not is_admin else (x_provider_id.strip() if x_provider_id else "default_provider")
+
+                return AuthenticatedPrincipal(
+                    principal_id=user.username,
+                    provider_id=target_provider,
+                    is_admin=is_admin,
+                    admin_override=is_admin,
+                    auth_method="jwt",
+                )
+            except HTTPException:
+                raise
+            except Exception as jwt_err:
+                logger.debug("Failed parsing as JWT: %s", jwt_err)
+
+        # 1b. Explicit database credential check
         cred = credential_manager.verify_credential(token)
         if cred:
             if x_provider_id and x_provider_id.strip():
@@ -292,6 +350,7 @@ def get_optional_principal(
     x_provider_id: Optional[str] = Header(None, alias="X-Provider-Id"),
     x_admin_override: Optional[str] = Header(None, alias="X-Admin-Override"),
     session_cookie: Optional[str] = Cookie(None, alias="expo_session"),
+    expo_jwt_cookie: Optional[str] = Cookie(None, alias="expo_jwt"),
     x_csrf_token: Optional[str] = Header(None, alias="X-CSRF-Token"),
 ) -> Optional[AuthenticatedPrincipal]:
     """Gracefully resolves principal if authenticated, otherwise returns None without throwing."""
@@ -303,6 +362,7 @@ def get_optional_principal(
             x_provider_id=x_provider_id,
             x_admin_override=x_admin_override,
             session_cookie=session_cookie,
+            expo_jwt_cookie=expo_jwt_cookie,
             x_csrf_token=x_csrf_token,
         )
     except HTTPException:

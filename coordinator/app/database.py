@@ -407,5 +407,53 @@ def init_db(db_path: Path) -> None:
             "CREATE INDEX IF NOT EXISTS idx_mig_chunk ON node_drain_migrations (file_id, chunk_id, shard_index)"
         )
 
+        # Human User Accounts and Role-Based Access Control (RBAC)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'consumer',
+                is_active INTEGER NOT NULL DEFAULT 1,
+                provider_id TEXT,
+                role_version INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users (username)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users (email)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users (role)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_provider ON users (provider_id)")
+
+        # JWT Token Revocation Blacklist
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS revoked_tokens (
+                jti TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                revoked_at TEXT NOT NULL,
+                reason TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_revoked_expires ON revoked_tokens (expires_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_revoked_user ON revoked_tokens (user_id)")
+
+        # User schema migrations
+        cursor_users = conn.execute("PRAGMA table_info(users)")
+        user_cols = [row["name"] for row in cursor_users.fetchall()]
+        if user_cols:
+            if "role_version" not in user_cols:
+                conn.execute("ALTER TABLE users ADD COLUMN role_version INTEGER NOT NULL DEFAULT 1")
+            if "provider_id" not in user_cols:
+                conn.execute("ALTER TABLE users ADD COLUMN provider_id TEXT")
+            if "is_active" not in user_cols:
+                conn.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+
         conn.commit()
 

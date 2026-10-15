@@ -55,6 +55,20 @@ class CoordinatorSettings(BaseModel):
         default_factory=lambda: int(os.getenv("NODE_HEARTBEAT_TIMEOUT_SECONDS", "30"))
     )
 
+    # JWT Authentication settings
+    jwt_secret: str = Field(
+        default_factory=lambda: os.getenv(
+            "COORDINATOR_JWT_SECRET",
+            "expo_jwt_development_secret_key_do_not_use_in_production_32chars!",
+        )
+    )
+    jwt_algorithm: str = Field(default="HS256")
+    jwt_access_token_expire_minutes: int = Field(
+        default_factory=lambda: int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+    )
+    jwt_issuer: str = Field(default="expo-store-share")
+    jwt_audience: str = Field(default="expo-store-share-api")
+
 
 def get_coordinator_settings() -> CoordinatorSettings:
     """Returns initialized CoordinatorSettings instance."""

@@ -14,11 +14,13 @@ from fastapi import (
     Depends,
     Header,
     Query,
+    Cookie,
     status,
     Request,
     BackgroundTasks,
 )
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 from coordinator.app import __version__
 from coordinator.app.config import get_coordinator_settings, CoordinatorSettings
@@ -46,13 +48,34 @@ from coordinator.app.file_catalog import (
     FileNotFoundError as CatalogFileNotFoundError,
 )
 from coordinator.app.reconciliation import ReconciliationService
+from coordinator.app.user_auth import get_optional_user
 
 logger = logging.getLogger("expo_coordinator")
+
+def resolve_user_from_request(req: Request):
+    """Safely extracts UserRecord from request state or resolves from headers/cookies if present."""
+    if not req:
+        return None
+    return getattr(req.state, "current_user", None) or get_optional_user(req)
 
 app = FastAPI(
     title="Expo Coordinator API",
     version=__version__,
     description="Control and management service for Expo distributed storage node registry and discovery.",
+)
+
+# Configure CORS for explicitly trusted frontend origins
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -150,24 +173,58 @@ def verify_coordinator_auth(
     settings: Annotated[CoordinatorSettings, Depends(get_settings)],
     x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token"),
     authorization: Optional[str] = Header(None, alias="Authorization"),
+    expo_jwt_cookie: Optional[str] = Cookie(None, alias="expo_jwt"),
 ) -> str:
+    token = None
+    if isinstance(x_auth_token, str) and x_auth_token.strip():
+        token = x_auth_token.strip()
+    elif isinstance(authorization, str) and authorization.strip().lower().startswith("bearer "):
+        token = authorization.strip()[7:].strip()
+    elif isinstance(expo_jwt_cookie, str) and expo_jwt_cookie.strip():
+        token = expo_jwt_cookie.strip()
+
+    # 1. If token is a signed JWT (human user authentication)
+    if token and token.count(".") == 2:
+        from coordinator.app.user_auth import decode_access_token, UserManager
+        user_manager = UserManager(settings)
+
+        try:
+            payload = decode_access_token(token, settings)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Unauthorized: Invalid JWT token ({str(exc)}).",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        jti = payload.get("jti")
+        user_id = payload.get("sub")
+        if user_manager.is_token_revoked(jti):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized: Token has been revoked.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        user = user_manager.get_user_by_id(user_id)
+        if not user or not user.is_active or user.role_version != payload.get("role_version", 1):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized: User account inactive or privileges revoked.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return user.username
+
+    # 2. Machine token check for storage nodes / legacy SDK
     valid_tokens = [t.strip() for t in (settings.auth_token, settings.admin_auth_token) if t and t.strip()]
     if not valid_tokens:
         return "default_user"
 
-    client_token = None
-    if x_auth_token:
-        client_token = x_auth_token.strip()
-    elif authorization and authorization.lower().startswith("bearer "):
-        client_token = authorization[7:].strip()
-
-    if not client_token or client_token not in valid_tokens:
+    if not token or token not in valid_tokens:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized: Invalid or missing coordinator authentication token.",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return client_token
+    return token
 
 
 # Custom Exception Handlers
@@ -216,10 +273,26 @@ def health() -> HealthResponse:
     summary="Register or Update a Storage Node",
 )
 def register_node(
+    request: Request,
     data: NodeRegisterRequest,
     registry: Annotated[NodeRegistry, Depends(get_registry)],
 ) -> NodeRecord:
     """Registers a new Storage Node or updates an existing registered node (Idempotent)."""
+    user = resolve_user_from_request(request)
+    if user:
+        if user.role == "consumer":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Forbidden: Consumer accounts cannot register storage nodes.",
+            )
+        if user.role == "provider":
+            if data.provider_id and data.provider_id.strip() != (user.provider_id or "").strip():
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Forbidden: You are not authorized to register nodes for provider '{data.provider_id}'.",
+                )
+            data.provider_id = user.provider_id or "default_provider"
+
     return registry.register_node(data)
 
 
@@ -372,10 +445,31 @@ def node_heartbeat(
     summary="Deregister / Remove Storage Node",
 )
 def delete_node(
+    request: Request,
     node_id: str,
     registry: Annotated[NodeRegistry, Depends(get_registry)],
 ):
     """Deletes a node record from the Coordinator registry."""
+    user = resolve_user_from_request(request)
+    if user:
+        if user.role == "consumer":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Forbidden: Consumer accounts cannot deregister storage nodes.",
+            )
+        if user.role == "provider":
+            node = registry.get_node(node_id)
+            if not node:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Node with ID '{node_id}' not found.",
+                )
+            if node.provider_id and node.provider_id != user.provider_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Forbidden: You are not authorized to deregister node belonging to provider '{node.provider_id}'.",
+                )
+
     success = registry.delete_node(node_id)
     if not success:
         raise HTTPException(
@@ -396,11 +490,21 @@ _coordinator_repair_jobs: Dict[str, Dict[str, Any]] = {}
     summary="List Coordinator Repair Jobs",
 )
 def list_repair_jobs(
+    request: Request,
     state: Optional[str] = Query(None, description="Filter jobs by state ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', etc.)"),
     file_id: Optional[str] = Query(None, description="Filter jobs by target file_id"),
+    catalog: FileCatalog = Depends(get_catalog),
 ) -> RepairJobListResponse:
     """Retrieves repair jobs tracked by the Coordinator."""
     results = list(_coordinator_repair_jobs.values())
+    user = resolve_user_from_request(request)
+    if user:
+        if user.role == "consumer":
+            user_files = {f["file_id"] for f in catalog.list_files(user.username)}
+            results = [j for j in results if j.get("file_id") in user_files]
+        elif user.role == "provider":
+            results = [j for j in results if j.get("source_node_id") == user.provider_id or j.get("destination_node_id") == user.provider_id]
+
     if state:
         results = [j for j in results if j.get("state") == state]
     if file_id:
@@ -465,11 +569,20 @@ def get_repair_job(job_id: str) -> RepairJobRecord:
     summary="Register a Logical File"
 )
 def register_file(
+    request_http: Request,
     request: RegisterFileRequest,
     owner_id: str = Depends(verify_coordinator_auth),
     catalog: FileCatalog = Depends(get_catalog)
 ):
     """Registers a newly uploaded file using its manifest."""
+    user = resolve_user_from_request(request_http)
+    if user:
+        if user.role == "provider":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Forbidden: Provider accounts cannot register consumer files.",
+            )
+        owner_id = user.username
     try:
         return catalog.register_file(owner_id, request.manifest)
     except ValueError as e:
@@ -483,10 +596,23 @@ def register_file(
     summary="List Logical Files"
 )
 def list_files(
+    request_http: Request,
     owner_id: str = Depends(verify_coordinator_auth),
     catalog: FileCatalog = Depends(get_catalog)
 ):
     """Lists files owned by the authenticated user."""
+    user = resolve_user_from_request(request_http)
+    if user:
+        if user.role == "provider":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Forbidden: Provider accounts cannot access consumer file catalogs.",
+            )
+        if user.role == "admin":
+            files = catalog.list_files(None)
+            return FileCatalogListResponse(files=files)
+        owner_id = user.username
+
     files = catalog.list_files(owner_id)
     return FileCatalogListResponse(files=files)
 
@@ -498,13 +624,34 @@ def list_files(
     summary="Get Logical File Metadata"
 )
 def get_file(
+    request_http: Request,
     file_id: str,
     owner_id: str = Depends(verify_coordinator_auth),
     catalog: FileCatalog = Depends(get_catalog)
 ):
     """Retrieves file catalog metadata by ID."""
+    is_admin = False
+    user = resolve_user_from_request(request_http)
+    if user:
+        if user.role == "provider":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Forbidden: Provider accounts cannot inspect consumer file metadata.",
+            )
+        if user.role == "admin":
+            is_admin = True
+        else:
+            owner_id = user.username
+
     try:
-        return catalog.get_file(file_id, owner_id)
+        file_rec = catalog.get_file(file_id, None if is_admin else owner_id)
+        if user:
+            if user.role == "consumer" and file_rec["owner_id"] not in (user.user_id, user.username):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Forbidden: You do not have permission to access files owned by another user.",
+                )
+        return file_rec
     except CatalogFileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
@@ -516,6 +663,7 @@ def get_file(
     summary="Mark Logical File for Deletion"
 )
 def mark_file_deleting(
+    request_http: Request,
     file_id: str,
     background_tasks: BackgroundTasks,
     finalize: bool = False,
@@ -524,15 +672,39 @@ def mark_file_deleting(
     recon: ReconciliationService = Depends(get_reconciliation_service)
 ):
     """Marks a file as 'deleting' or fully 'deleted', scheduling durable cleanup."""
+    is_admin = False
+    user = resolve_user_from_request(request_http)
+    if user:
+        if user.role == "provider":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Forbidden: Provider accounts cannot delete consumer files.",
+            )
+        if user.role == "admin":
+            is_admin = True
+        else:
+            owner_id = user.username
+
     try:
+        if user:
+            file_rec = catalog.get_file(file_id, None if is_admin else owner_id)
+            if user.role == "consumer" and file_rec["owner_id"] not in (user.user_id, user.username):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Forbidden: You do not have permission to delete files owned by another user.",
+                )
+            target_owner = file_rec["owner_id"]
+        else:
+            target_owner = owner_id
+
         if finalize:
-            return catalog.mark_deleted(file_id, owner_id)
+            return catalog.mark_deleted(file_id, target_owner)
         
-        file_record = catalog.get_file(file_id, owner_id)
+        file_record = catalog.get_file(file_id, target_owner)
         if file_record["status"] not in ("deleting", "deleted"):
-            job_id = recon.create_deletion_job(file_id, owner_id, file_record["manifest_json"])
+            job_id = recon.create_deletion_job(file_id, target_owner, file_record["manifest_json"])
             background_tasks.add_task(recon.process_deletion_job_bg, job_id)
-        return catalog.get_file(file_id, owner_id)
+        return catalog.get_file(file_id, target_owner)
     except CatalogFileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
@@ -546,11 +718,19 @@ from coordinator.app.models import ReconciliationReport
     summary="Run Reconciliation Service"
 )
 def reconcile_catalog(
+    request: Request,
     dry_run: bool = True,
     owner_id: str = Depends(verify_coordinator_auth),
     recon: ReconciliationService = Depends(get_reconciliation_service)
 ):
     """Run reconciliation to find orphaned objects, missing objects, and process stalled deletions."""
+    user = resolve_user_from_request(request)
+    if user:
+        if user.role != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Forbidden: Only administrators can trigger reconciliation runs.",
+            )
     return recon.run_reconciliation(dry_run=dry_run)
 
 
@@ -583,6 +763,10 @@ app.include_router(provider_router)
 @app.get("/dashboard", response_class=HTMLResponse, tags=["Provider Management"], summary="Provider Dashboard UI")
 def root_dashboard() -> HTMLResponse:
     return serve_provider_dashboard()
+
+# Mount User Authentication & RBAC Router
+from coordinator.app.auth_router import auth_router
+app.include_router(auth_router)
 
 static_dir = Path(__file__).parent / "static"
 if static_dir.exists():
