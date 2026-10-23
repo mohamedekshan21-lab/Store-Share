@@ -6,6 +6,7 @@ smart node selection, and Internet connectivity node discovery.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Annotated, Any, Dict, List, Optional
 from fastapi import (
@@ -14,9 +15,10 @@ from fastapi import (
     Depends,
     Header,
     Query,
-    status,
     Request,
     BackgroundTasks,
+    Cookie,
+    status,
 )
 from fastapi.responses import JSONResponse
 
@@ -35,6 +37,18 @@ from coordinator.app.models import (
     RegisterFileRequest,
     FileCatalogRecord,
     FileCatalogListResponse,
+    RequestUploadCapabilitiesRequest,
+    RequestUploadCapabilitiesResponse,
+    RequestDownloadCapabilitiesRequest,
+    RequestDownloadCapabilitiesResponse,
+    AccountQuotaResponse,
+    ReserveQuotaRequest,
+    ReserveQuotaResponse,
+    ReleaseQuotaRequest,
+    ReleaseQuotaResponse,
+    UpdateAccountQuotaRequest,
+    UpdateAccountQuotaResponse,
+    FileStorageStatusResponse,
 )
 from coordinator.app.node_registry import (
     NodeRegistry,
@@ -43,16 +57,39 @@ from coordinator.app.node_registry import (
 )
 from coordinator.app.file_catalog import (
     FileCatalog,
+    FileCatalogError,
     FileNotFoundError as CatalogFileNotFoundError,
 )
+from coordinator.app.quota_manager import (
+    QuotaManager,
+    QuotaError,
+    QuotaExceededError,
+)
+from coordinator.app.auth import AccountManager
 from coordinator.app.reconciliation import ReconciliationService
-
-logger = logging.getLogger("expo_coordinator")
+from coordinator.app.database import get_db_connection
 
 app = FastAPI(
     title="Expo Coordinator API",
     version=__version__,
     description="Control and management service for Expo distributed storage node registry and discovery.",
+)
+
+# CORS Middleware (allows decoupled frontend development on ports 3000, 5173, etc.)
+from starlette.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -85,8 +122,8 @@ def get_settings(request: Request) -> CoordinatorSettings:
 
 def get_registry(request: Request) -> NodeRegistry:
     """Dependency provider for NodeRegistry instance."""
-    if not hasattr(request.app.state, "registry"):
-        settings = get_settings(request)
+    settings = get_settings(request)
+    if not hasattr(request.app.state, "registry") or getattr(request.app.state.registry, "db_path", None) != settings.db_path:
         request.app.state.registry = NodeRegistry(settings)
     return request.app.state.registry
 
@@ -100,8 +137,8 @@ def get_settings_from_state(app_state: Any) -> CoordinatorSettings:
 
 def get_registry_from_state(app_state: Any) -> NodeRegistry:
     """Resolves the NodeRegistry directly from app state (for non-Request contexts, e.g. WebSocket)."""
-    if not hasattr(app_state, "registry"):
-        settings = app_state.settings if hasattr(app_state, "settings") else get_coordinator_settings()
+    settings = app_state.settings if hasattr(app_state, "settings") else get_coordinator_settings()
+    if not hasattr(app_state, "registry") or getattr(app_state.registry, "db_path", None) != settings.db_path:
         app_state.registry = NodeRegistry(settings)
     return app_state.registry
 
@@ -111,9 +148,20 @@ def get_catalog(
     settings: Annotated[CoordinatorSettings, Depends(get_settings)]
 ) -> FileCatalog:
     """Dependency provider for FileCatalog instance."""
-    if not hasattr(request.app.state, "catalog"):
+    if not hasattr(request.app.state, "catalog") or getattr(request.app.state.catalog, "db_path", None) != settings.db_path:
         request.app.state.catalog = FileCatalog(settings)
     return request.app.state.catalog
+
+
+def get_quota_manager(
+    request: Request,
+    settings: Annotated[CoordinatorSettings, Depends(get_settings)]
+) -> QuotaManager:
+    """Dependency provider for QuotaManager instance."""
+    if not hasattr(request.app.state, "quota_manager") or getattr(request.app.state.quota_manager, "db_path", None) != settings.db_path:
+        request.app.state.quota_manager = QuotaManager(settings)
+        request.app.state.quota_manager.recover_durable_reservations()
+    return request.app.state.quota_manager
 
 
 def get_reconciliation_service(
@@ -121,7 +169,7 @@ def get_reconciliation_service(
     settings: Annotated[CoordinatorSettings, Depends(get_settings)]
 ) -> ReconciliationService:
     """Dependency provider for ReconciliationService."""
-    if not hasattr(request.app.state, "reconciliation_service"):
+    if not hasattr(request.app.state, "reconciliation_service") or getattr(request.app.state.reconciliation_service, "db_path", None) != settings.db_path:
         request.app.state.reconciliation_service = ReconciliationService(settings)
     return request.app.state.reconciliation_service
 
@@ -131,8 +179,8 @@ def get_metering_service(
 ) -> MeteringService:
     """Dependency provider for MeteringService."""
     from coordinator.app.metering import MeteringService
-    if not hasattr(request.app.state, "metering_service"):
-        settings = get_settings(request)
+    settings = get_settings(request)
+    if not hasattr(request.app.state, "metering_service") or getattr(request.app.state.metering_service, "db_path", None) != settings.db_path:
         request.app.state.metering_service = MeteringService(settings)
     return request.app.state.metering_service
 
@@ -140,10 +188,27 @@ def get_metering_service(
 def get_metering_service_from_state(app_state: Any) -> MeteringService:
     """Resolves MeteringService from app state directly."""
     from coordinator.app.metering import MeteringService
-    if not hasattr(app_state, "metering_service"):
-        settings = get_settings_from_state(app_state)
+    settings = get_settings_from_state(app_state)
+    if not hasattr(app_state, "metering_service") or getattr(app_state.metering_service, "db_path", None) != settings.db_path:
         app_state.metering_service = MeteringService(settings)
     return app_state.metering_service
+
+
+
+
+def get_account_manager(
+    request: Request,
+    settings: Annotated[CoordinatorSettings, Depends(get_settings)],
+) -> AccountManager:
+    """Dependency provider for AccountManager instance."""
+    if not hasattr(request.app.state, "account_manager") or getattr(request.app.state.account_manager, "db_path", None) != settings.db_path:
+        request.app.state.account_manager = AccountManager(settings)
+        if settings.admin_email and settings.admin_password:
+            try:
+                request.app.state.account_manager.bootstrap_admin(settings.admin_email, settings.admin_password)
+            except Exception as e:
+                logger.error("Failed to bootstrap administrator: %s", e)
+    return request.app.state.account_manager
 
 
 def verify_coordinator_auth(
@@ -153,6 +218,12 @@ def verify_coordinator_auth(
 ) -> str:
     valid_tokens = [t.strip() for t in (settings.auth_token, settings.admin_auth_token) if t and t.strip()]
     if not valid_tokens:
+        if settings.environment == "production":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized: Production coordinator authentication is not configured.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         return "default_user"
 
     client_token = None
@@ -168,6 +239,206 @@ def verify_coordinator_auth(
             headers={"WWW-Authenticate": "Bearer"},
         )
     return client_token
+
+
+def verify_registration_auth(
+    request: Request,
+    settings: Annotated[CoordinatorSettings, Depends(get_settings)],
+    account_manager: Annotated[AccountManager, Depends(get_account_manager)],
+    x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    session_cookie: Optional[str] = Cookie(None, alias="expo_session"),
+) -> tuple[str, Optional[str], bool]:
+    """
+    Validates authentication for Storage Node registration.
+    Supports coordinator tokens, administrative tokens, and authenticated provider sessions.
+    Returns: (principal_id, bound_provider_id, is_admin)
+    """
+    token = None
+    if x_auth_token and x_auth_token.strip():
+        token = x_auth_token.strip()
+    elif authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    elif session_cookie and session_cookie.strip():
+        token = session_cookie.strip()
+
+    valid_admin = settings.admin_auth_token.strip() if settings.admin_auth_token else None
+    valid_coord = settings.auth_token.strip() if settings.auth_token else None
+
+    # 1. Admin auth token check
+    if valid_admin and token == valid_admin:
+        return ("admin", None, True)
+
+    # 2. Coordinator auth token check
+    if valid_coord and token == valid_coord:
+        return ("coordinator", None, False)
+
+    # 3. Account session check
+    if token:
+        sess = account_manager.get_session(token)
+        if sess:
+            act = account_manager.get_account(sess.account_id)
+            if not act or act.status in ("suspended", "disabled", "inactive"):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Account '{sess.account_id}' is inactive or suspended. Registration denied.",
+                )
+            if not sess.is_admin:
+                with get_db_connection(settings.db_path) as conn:
+                    onb = conn.execute(
+                        "SELECT is_verified, status FROM provider_onboarding WHERE account_id = ? OR provider_id = ?",
+                        (sess.account_id, sess.provider_id or ""),
+                    ).fetchone()
+                    if not onb or not onb["is_verified"] or onb["status"] != "active":
+                        raise HTTPException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Provider onboarding and terms agreement required before registering storage nodes.",
+                        )
+            prov_id = sess.provider_id or (f"provider-{sess.account_id}" if not sess.is_admin else "admin_provider")
+            return (sess.account_id, prov_id, sess.is_admin)
+
+        # 4. Credential manager check
+        from coordinator.app.auth import CredentialManager
+        cred_mgr = CredentialManager(settings)
+        cred = cred_mgr.verify_credential(token)
+        if cred:
+            return (cred.principal_id, cred.provider_id, cred.is_admin)
+
+    # If auth_token or admin_auth_token is configured on coordinator,
+    # any missing or non-matching token must raise 401:
+    if valid_coord or valid_admin:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Invalid or missing coordinator authentication token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # If NO auth tokens are configured:
+    if not token:
+        if settings.environment == "production":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized: Missing authentication token.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return ("default_user", None, False)
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Unauthorized: Invalid coordinator or provider authentication token.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def get_authenticated_consumer(
+    request: Request,
+    settings: Annotated[CoordinatorSettings, Depends(get_settings)],
+    account_manager: Annotated[AccountManager, Depends(get_account_manager)],
+    x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    session_cookie: Optional[str] = Cookie(None, alias="expo_session"),
+    x_csrf_token: Optional[str] = Header(None, alias="X-CSRF-Token"),
+) -> str:
+    """
+    Resolves the authenticated consumer account UUID for catalog and file operations.
+    Enforces that consumer file ownership is strictly bound to account UUIDs.
+    Never accepts arbitrary user-supplied owner IDs.
+    """
+    token = None
+    is_cookie = False
+    if x_auth_token and x_auth_token.strip():
+        token = x_auth_token.strip()
+    elif authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    elif session_cookie and session_cookie.strip():
+        token = session_cookie.strip()
+        is_cookie = True
+
+    if token:
+        # 1. Check account session (Account UUID)
+        acc_session = account_manager.get_session(token)
+        if acc_session:
+            if is_cookie and request.method in ("POST", "PUT", "DELETE", "PATCH"):
+                if not x_csrf_token or x_csrf_token.strip() != acc_session.csrf_token:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Forbidden: Invalid or missing CSRF token.",
+                    )
+            if getattr(settings, "require_email_verification", False) and request.method in ("POST", "PUT", "DELETE", "PATCH"):
+                acc = account_manager.get_account(acc_session.account_id)
+                if acc and not acc.email_verified:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Email verification required. Please verify your email address to perform this action.",
+                    )
+            return acc_session.account_id
+
+        # 2. Check legacy coordinator token in non-production
+        valid_tokens = [t.strip() for t in (settings.auth_token, settings.admin_auth_token) if t and t.strip()]
+        if settings.environment == "production":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized: Consumer file operations require an authenticated account session.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        if not valid_tokens or token in valid_tokens:
+            return token
+
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Invalid coordinator authentication token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # No token provided
+    if settings.environment == "production" or request.url.path.startswith("/consumer"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required. Please sign in to access consumer file management." if request.url.path.startswith("/consumer") else "Unauthorized: Production coordinator authentication is required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    valid_tokens = [t.strip() for t in (settings.auth_token, settings.admin_auth_token) if t and t.strip()]
+    if not valid_tokens:
+        return "default_user"
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Unauthorized: Invalid or missing coordinator authentication token.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def verify_admin_auth(
+    settings: Annotated[CoordinatorSettings, Depends(get_settings)],
+    account_manager: Annotated[AccountManager, Depends(get_account_manager)],
+    x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    session_cookie: Optional[str] = Cookie(None, alias="expo_session"),
+) -> str:
+    """Verifies that the caller has explicit administrator privileges."""
+    token = None
+    if x_auth_token and x_auth_token.strip():
+        token = x_auth_token.strip()
+    elif authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    elif session_cookie and session_cookie.strip():
+        token = session_cookie.strip()
+
+    valid_admin = settings.admin_auth_token.strip() if settings.admin_auth_token else None
+    if valid_admin and token == valid_admin:
+        return "admin"
+
+    if token:
+        sess = account_manager.get_session(token)
+        if sess and sess.is_admin:
+            return sess.account_id
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Forbidden: Explicit administrator privileges required.",
+    )
 
 
 # Custom Exception Handlers
@@ -195,6 +466,14 @@ async def value_error_handler(request: Request, exc: ValueError):
     )
 
 
+@app.exception_handler(FileCatalogError)
+async def file_catalog_error_handler(request: Request, exc: FileCatalogError):
+    return JSONResponse(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content={"detail": str(exc)},
+    )
+
+
 # Endpoints
 @app.get(
     "/health",
@@ -211,16 +490,61 @@ def health() -> HealthResponse:
     "/nodes/register",
     response_model=NodeRecord,
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(verify_coordinator_auth)],
     tags=["Registry"],
     summary="Register or Update a Storage Node",
 )
 def register_node(
     data: NodeRegisterRequest,
     registry: Annotated[NodeRegistry, Depends(get_registry)],
+    settings: Annotated[CoordinatorSettings, Depends(get_settings)],
+    auth_info: tuple[str, Optional[str], bool] = Depends(verify_registration_auth),
 ) -> NodeRecord:
     """Registers a new Storage Node or updates an existing registered node (Idempotent)."""
-    return registry.register_node(data)
+    principal_id, bound_provider_id, is_admin = auth_info
+
+    # If bound to a provider account, prevent spoofing
+    if bound_provider_id and not is_admin:
+        setattr(data, "_from_account_session", True)
+        if data.provider_id and data.provider_id.strip() and data.provider_id.strip() != bound_provider_id and data.provider_id != "default_provider":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Access denied: Cannot register node for another provider '{data.provider_id}'.",
+            )
+        data.provider_id = bound_provider_id
+    elif bound_provider_id and is_admin:
+        setattr(data, "_from_account_session", True)
+    elif not bound_provider_id and data.provider_id and data.provider_id != "default_provider":
+        # Check that provider account is not suspended/disabled
+        with get_db_connection(settings.db_path) as conn:
+            act = conn.execute(
+                "SELECT status FROM accounts WHERE provider_id = ? OR account_id = ?",
+                (data.provider_id, data.provider_id),
+            ).fetchone()
+            if act and act["status"] in ("suspended", "disabled", "inactive"):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Provider account '{data.provider_id}' is {act['status']}. Registration denied.",
+                )
+
+    # Check ownership of existing node to prevent claiming another provider's node identity
+    clean_nid = data.node_id.strip() if data.node_id else ""
+    if clean_nid and not is_admin:
+        existing_node = registry.get_node(clean_nid)
+        if existing_node and existing_node.provider_id and existing_node.provider_id != "default_provider":
+            effective_caller_provider = bound_provider_id or data.provider_id
+            if effective_caller_provider and existing_node.provider_id != effective_caller_provider:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Access denied: Node '{clean_nid}' is already registered to provider '{existing_node.provider_id}'.",
+                )
+
+    try:
+        return registry.register_node(data)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
 
 
 @app.get(
@@ -466,12 +790,17 @@ def get_repair_job(job_id: str) -> RepairJobRecord:
 )
 def register_file(
     request: RegisterFileRequest,
-    owner_id: str = Depends(verify_coordinator_auth),
-    catalog: FileCatalog = Depends(get_catalog)
+    owner_id: str = Depends(get_authenticated_consumer),
+    catalog: FileCatalog = Depends(get_catalog),
+    quota_mgr: QuotaManager = Depends(get_quota_manager),
 ):
-    """Registers a newly uploaded file using its manifest."""
+    """Registers a newly uploaded file using its manifest, validating size and committing quota."""
     try:
-        return catalog.register_file(owner_id, request.manifest)
+        return catalog.register_file(owner_id, request.manifest, quota_mgr=quota_mgr)
+    except QuotaExceededError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except FileCatalogError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -483,7 +812,7 @@ def register_file(
     summary="List Logical Files"
 )
 def list_files(
-    owner_id: str = Depends(verify_coordinator_auth),
+    owner_id: str = Depends(get_authenticated_consumer),
     catalog: FileCatalog = Depends(get_catalog)
 ):
     """Lists files owned by the authenticated user."""
@@ -499,14 +828,288 @@ def list_files(
 )
 def get_file(
     file_id: str,
-    owner_id: str = Depends(verify_coordinator_auth),
-    catalog: FileCatalog = Depends(get_catalog)
+    owner_id: str = Depends(get_authenticated_consumer),
+    catalog: FileCatalog = Depends(get_catalog),
+    settings: CoordinatorSettings = Depends(get_settings),
 ):
-    """Retrieves file catalog metadata by ID."""
+    """Retrieves file catalog metadata by ID, enriching chunk placements with signed download capabilities."""
     try:
-        return catalog.get_file(file_id, owner_id)
+        raw_rec = catalog.get_file(file_id, owner_id)
+        rec = dict(raw_rec)
+        raw_manifest = rec.get("manifest_json")
+        if raw_manifest and settings and settings.effective_capability_secret:
+            try:
+                manifest_dict = json.loads(raw_manifest)
+                from coordinator.app.capability import issue_download_capability
+                # Enrich replication chunks
+                for chunk in manifest_dict.get("chunks", []):
+                    c_id = chunk.get("chunk_id")
+                    c_sha = chunk.get("sha256")
+                    for p in chunk.get("placements", []):
+                        n_id = p.get("node_id") or "NODE-LOCAL"
+                        p_cid = p.get("chunk_id") or c_id
+                        if n_id and p_cid:
+                            try:
+                                p["capability"] = issue_download_capability(
+                                    settings=settings,
+                                    node_id=n_id,
+                                    chunk_id=p_cid,
+                                    account_id=owner_id,
+                                    expected_sha256=c_sha,
+                                )
+                            except Exception:
+                                pass
+                    # Enrich erasure shards
+                    for shard in chunk.get("shards", []):
+                        s_id = shard.get("shard_id")
+                        s_sha = shard.get("sha256")
+                        n_id = shard.get("node_id") or "NODE-LOCAL"
+                        if n_id and s_id:
+                            try:
+                                shard["capability"] = issue_download_capability(
+                                    settings=settings,
+                                    node_id=n_id,
+                                    chunk_id=s_id,
+                                    account_id=owner_id,
+                                    expected_sha256=s_sha,
+                                )
+                            except Exception:
+                                pass
+                rec["manifest_json"] = json.dumps(manifest_dict)
+            except Exception:
+                pass
+        return rec
     except CatalogFileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+
+@app.get(
+    "/catalog/files/{file_id}/status",
+    response_model=FileStorageStatusResponse,
+    tags=["Catalog"],
+    summary="Get Logical File Storage and Degradation Status",
+)
+def get_file_storage_status_endpoint(
+    file_id: str,
+    owner_id: str = Depends(get_authenticated_consumer),
+    catalog: FileCatalog = Depends(get_catalog),
+    registry: NodeRegistry = Depends(get_registry),
+):
+    """Retrieves file storage health, checking chunk/shard placement availability on storage nodes."""
+    try:
+        return catalog.get_file_storage_status(file_id, owner_id, registry)
+    except CatalogFileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+
+# Phase 10D: Account Storage Quotas
+
+@app.get(
+    "/catalog/quota",
+    response_model=AccountQuotaResponse,
+    tags=["Catalog"],
+    summary="Get Authenticated Account Storage Quota",
+)
+def get_account_quota_endpoint(
+    owner_id: str = Depends(get_authenticated_consumer),
+    quota_mgr: QuotaManager = Depends(get_quota_manager),
+):
+    """Retrieves configured storage limit, committed usage, active reservations, and remaining quota."""
+    return quota_mgr.get_account_quota(owner_id)
+
+
+@app.post(
+    "/catalog/quota/reserve",
+    response_model=ReserveQuotaResponse,
+    tags=["Catalog"],
+    summary="Atomically Reserve Storage Quota",
+)
+def reserve_quota_endpoint(
+    data: ReserveQuotaRequest,
+    owner_id: str = Depends(get_authenticated_consumer),
+    quota_mgr: QuotaManager = Depends(get_quota_manager),
+):
+    """Atomically reserves account storage quota before beginning file transfers."""
+    try:
+        res_id = quota_mgr.reserve_quota(
+            account_id=owner_id,
+            requested_bytes=data.expected_bytes,
+            file_id=data.file_id,
+            ttl_seconds=data.ttl_seconds,
+        )
+        now = quota_mgr._now_utc()
+        ttl = data.ttl_seconds or getattr(quota_mgr.settings, "account_reservation_ttl_seconds", 300)
+        from datetime import timedelta
+        expires_at = (now + timedelta(seconds=ttl)).isoformat()
+        return ReserveQuotaResponse(
+            reservation_id=res_id,
+            account_id=owner_id,
+            reserved_bytes=data.expected_bytes,
+            expires_at=expires_at,
+            status="active",
+        )
+    except QuotaExceededError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+
+@app.post(
+    "/catalog/quota/release",
+    response_model=ReleaseQuotaResponse,
+    tags=["Catalog"],
+    summary="Release Storage Quota Reservation",
+)
+def release_quota_endpoint(
+    data: ReleaseQuotaRequest,
+    owner_id: str = Depends(get_authenticated_consumer),
+    quota_mgr: QuotaManager = Depends(get_quota_manager),
+):
+    """Releases an active reservation upon failed upload or transfer abort."""
+    count = quota_mgr.release_reservation(
+        reservation_id=data.reservation_id,
+        account_id=owner_id,
+        file_id=data.file_id,
+    )
+    return ReleaseQuotaResponse(status="released", released_count=count)
+
+
+@app.put(
+    "/auth/accounts/{account_id}/quota",
+    response_model=UpdateAccountQuotaResponse,
+    tags=["Authentication & Identity"],
+    summary="Update Account Storage Quota (Administrator only)",
+)
+def update_account_quota_endpoint(
+    account_id: str,
+    data: UpdateAccountQuotaRequest,
+    admin_auth: str = Depends(verify_admin_auth),
+    quota_mgr: QuotaManager = Depends(get_quota_manager),
+):
+    """Administratively updates the configured storage quota for an account."""
+    success = quota_mgr.update_account_quota(account_id, data.quota_bytes)
+    if not success:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Account '{account_id}' not found.")
+    return UpdateAccountQuotaResponse(
+        account_id=account_id,
+        quota_bytes=data.quota_bytes,
+        message="Account storage quota updated successfully.",
+    )
+
+
+@app.post(
+    "/catalog/capabilities/upload",
+    response_model=RequestUploadCapabilitiesResponse,
+    tags=["Catalog"],
+    summary="Issue Upload Capabilities for Chunks",
+)
+def request_upload_capabilities(
+    data: RequestUploadCapabilitiesRequest,
+    owner_id: str = Depends(get_authenticated_consumer),
+    settings: CoordinatorSettings = Depends(get_settings),
+    quota_mgr: QuotaManager = Depends(get_quota_manager),
+) -> RequestUploadCapabilitiesResponse:
+    """Issues signed, narrowly scoped upload capabilities for chunks and storage nodes after atomic quota reservation."""
+    # 1. Atomically reserve quota for upload
+    needed_bytes = data.original_size
+    if needed_bytes is None:
+        needed_bytes = sum(item.size or 0 for item in data.chunks)
+
+    if needed_bytes > 0:
+        try:
+            quota_mgr.reserve_quota(
+                account_id=owner_id,
+                requested_bytes=needed_bytes,
+                file_id=data.file_id,
+            )
+        except QuotaExceededError as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+
+    from coordinator.app.capability import issue_upload_capability
+    result: Dict[str, Dict[str, str]] = {}
+    for item in data.chunks:
+        c_id = item.chunk_id
+        result[c_id] = {}
+        for n_id in item.node_ids:
+            cap_token = issue_upload_capability(
+                settings=settings,
+                node_id=n_id,
+                chunk_id=c_id,
+                account_id=owner_id,
+                expected_size=item.size,
+                expected_sha256=item.sha256,
+            )
+            result[c_id][n_id] = cap_token
+
+    return RequestUploadCapabilitiesResponse(capabilities=result)
+
+
+@app.post(
+    "/catalog/capabilities/download",
+    response_model=RequestDownloadCapabilitiesResponse,
+    tags=["Catalog"],
+    summary="Issue Download Capabilities for File Chunks",
+)
+def request_download_capabilities(
+    data: RequestDownloadCapabilitiesRequest,
+    owner_id: str = Depends(get_authenticated_consumer),
+    catalog: FileCatalog = Depends(get_catalog),
+    settings: CoordinatorSettings = Depends(get_settings),
+) -> RequestDownloadCapabilitiesResponse:
+    """Issues signed download capabilities for authorized chunks of an owned file."""
+    try:
+        rec = catalog.get_file(data.file_id, owner_id)
+    except CatalogFileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+    raw_manifest = rec.get("manifest_json")
+    if not raw_manifest:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File manifest is missing.")
+
+    manifest_dict = json.loads(raw_manifest)
+    from coordinator.app.capability import issue_download_capability
+
+    requested_chunks = set(data.chunk_ids) if data.chunk_ids else None
+    result: Dict[str, Dict[str, str]] = {}
+
+    for chunk in manifest_dict.get("chunks", []):
+        c_id = chunk.get("chunk_id")
+        c_sha = chunk.get("sha256")
+        if requested_chunks and c_id not in requested_chunks:
+            has_matching_shard = any(s.get("shard_id") in requested_chunks for s in chunk.get("shards", []))
+            if not has_matching_shard:
+                continue
+
+        for p in chunk.get("placements", []):
+            n_id = p.get("node_id") or "NODE-LOCAL"
+            p_cid = p.get("chunk_id") or c_id
+            if requested_chunks and p_cid not in requested_chunks:
+                continue
+            if p_cid not in result:
+                result[p_cid] = {}
+            result[p_cid][n_id] = issue_download_capability(
+                settings=settings,
+                node_id=n_id,
+                chunk_id=p_cid,
+                account_id=owner_id,
+                expected_sha256=c_sha,
+            )
+
+        for shard in chunk.get("shards", []):
+            s_id = shard.get("shard_id")
+            s_sha = shard.get("sha256")
+            n_id = shard.get("node_id") or "NODE-LOCAL"
+            if requested_chunks and s_id not in requested_chunks:
+                continue
+            if s_id not in result:
+                result[s_id] = {}
+            result[s_id][n_id] = issue_download_capability(
+                settings=settings,
+                node_id=n_id,
+                chunk_id=s_id,
+                account_id=owner_id,
+                expected_sha256=s_sha,
+            )
+
+    return RequestDownloadCapabilitiesResponse(file_id=data.file_id, capabilities=result)
 
 
 @app.delete(
@@ -519,7 +1122,8 @@ def mark_file_deleting(
     file_id: str,
     background_tasks: BackgroundTasks,
     finalize: bool = False,
-    owner_id: str = Depends(verify_coordinator_auth),
+    sync_cleanup: bool = False,
+    owner_id: str = Depends(get_authenticated_consumer),
     catalog: FileCatalog = Depends(get_catalog),
     recon: ReconciliationService = Depends(get_reconciliation_service)
 ):
@@ -531,7 +1135,10 @@ def mark_file_deleting(
         file_record = catalog.get_file(file_id, owner_id)
         if file_record["status"] not in ("deleting", "deleted"):
             job_id = recon.create_deletion_job(file_id, owner_id, file_record["manifest_json"])
-            background_tasks.add_task(recon.process_deletion_job_bg, job_id)
+            if sync_cleanup:
+                recon.process_deletion_job_bg(job_id)
+            else:
+                background_tasks.add_task(recon.process_deletion_job_bg, job_id)
         return catalog.get_file(file_id, owner_id)
     except CatalogFileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -579,13 +1186,35 @@ from fastapi.responses import HTMLResponse
 from coordinator.app.provider_router import provider_router, serve_provider_dashboard
 app.include_router(provider_router)
 
-# Mount root dashboard endpoint and static assets
-@app.get("/dashboard", response_class=HTMLResponse, tags=["Provider Management"], summary="Provider Dashboard UI")
+# Mount Authentication and Multi-Tenant Account Identity Router (Phase 10A)
+from coordinator.app.auth_router import auth_router
+app.include_router(auth_router)
+
+# Mount Observability and Health Router & Middleware (Phase 10F)
+from coordinator.app.observability import CorrelationAndMetricsMiddleware, observability_router
+app.add_middleware(CorrelationAndMetricsMiddleware)
+app.include_router(observability_router)
+
+# Mount Administrative Control Router (Phase 10F)
+from coordinator.app.admin_router import admin_router
+app.include_router(admin_router)
+
+# Mount Consumer Application File Management Router (Phase 10F)
+from coordinator.app.consumer_router import consumer_router
+app.include_router(consumer_router)
+
+# Mount root dashboard endpoints and static assets
+@app.get("/", response_class=HTMLResponse, tags=["Application Portal"], summary="Unified Integrated Application UI")
+@app.get("/app", response_class=HTMLResponse, tags=["Application Portal"], summary="Integrated Application Portal UI")
+@app.get("/dashboard", response_class=HTMLResponse, tags=["Application Portal"], summary="Application Portal UI")
 def root_dashboard() -> HTMLResponse:
     return serve_provider_dashboard()
 
-static_dir = Path(__file__).parent / "static"
+# Check dedicated frontend folder first, fallback to coordinator/app/static
+frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
+static_dir = frontend_dir if frontend_dir.exists() else (Path(__file__).parent / "static")
 if static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
 
 

@@ -16,6 +16,7 @@ from fastapi.responses import HTMLResponse
 from coordinator.app.config import CoordinatorSettings, get_coordinator_settings
 from coordinator.app.database import get_db_connection
 from coordinator.app.main import (
+    get_settings,
     get_registry,
     get_metering_service,
     verify_coordinator_auth,
@@ -23,8 +24,9 @@ from coordinator.app.main import (
 from coordinator.app.node_registry import NodeRegistry, NodeNotFoundError
 from coordinator.app.metering import MeteringService
 from coordinator.app.accounting import AccountingService
-from coordinator.app.auth import ProviderSessionManager, AuthenticatedPrincipal, CredentialManager
+from coordinator.app.auth import ProviderSessionManager, AuthenticatedPrincipal, CredentialManager, AccountManager
 from coordinator.app.drain_service import NodeDrainService, DrainStatus
+from coordinator.app.node_validation import NodeValidator
 from coordinator.app.models import (
     NodeRecord,
     ProviderOverview,
@@ -41,6 +43,12 @@ from coordinator.app.models import (
     NodeDrainMigrationRecord,
     NodeDrainMigrationListResponse,
     DrainWorkerStatusResponse,
+    ProviderOnboardRequest,
+    ProviderOnboardResponse,
+    NodeValidationCheckItem,
+    NodeValidationResponse,
+    NodeProbationStatusResponse,
+    ProviderNodeValidationHistoryResponse,
 )
 
 logger = logging.getLogger("expo_provider_router")
@@ -110,8 +118,21 @@ def get_credential_manager(request: Request) -> CredentialManager:
     return request.app.state.credential_manager
 
 
+def get_account_manager(request: Request) -> AccountManager:
+    """Dependency provider for AccountManager."""
+    settings = (
+        request.app.state.settings
+        if hasattr(request.app.state, "settings")
+        else get_coordinator_settings()
+    )
+    if not hasattr(request.app.state, "account_manager") or getattr(request.app.state.account_manager, "db_path", None) != settings.db_path:
+        request.app.state.account_manager = AccountManager(settings)
+    return request.app.state.account_manager
+
+
 def get_current_principal(
     request: Request,
+    settings: Annotated[CoordinatorSettings, Depends(get_settings)],
     x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token"),
     authorization: Optional[str] = Header(None, alias="Authorization"),
     x_provider_id: Optional[str] = Header(None, alias="X-Provider-Id"),
@@ -127,13 +148,9 @@ def get_current_principal(
     - Explicit X-Admin-Override is required for cross-provider node mutations.
     - Session-authenticated state mutations require a valid CSRF token.
     """
-    settings = (
-        request.app.state.settings
-        if hasattr(request.app.state, "settings")
-        else get_coordinator_settings()
-    )
     session_manager = get_session_manager(request)
     credential_manager = get_credential_manager(request)
+    account_manager = get_account_manager(request)
     configured_token = settings.auth_token
     admin_configured_token = settings.admin_auth_token
     admin_override_requested = bool(x_admin_override and x_admin_override.strip().lower() == "true")
@@ -195,21 +212,41 @@ def get_current_principal(
                 auth_method="token",
             )
 
-        # 1d. Coordinator token check
+        # 1d. Account session check (from token)
+        account_session = account_manager.get_session(token)
+        if account_session:
+            if x_provider_id and x_provider_id.strip():
+                req_prov = x_provider_id.strip()
+                if not account_session.is_admin and account_session.provider_id != req_prov:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail=f"Access denied: Principal '{account_session.account_id}' is not authorized to act as provider '{req_prov}'.",
+                    )
+                target_provider = req_prov
+            else:
+                target_provider = account_session.provider_id or "default_provider"
+
+            return AuthenticatedPrincipal(
+                principal_id=account_session.account_id,
+                provider_id=target_provider,
+                account_id=account_session.account_id,
+                is_admin=account_session.is_admin,
+                admin_override=account_session.is_admin and admin_override_requested,
+                auth_method="token",
+                csrf_token=account_session.csrf_token,
+            )
+
+        # 1e. Coordinator token check
         if configured_token and configured_token.strip():
             if token == configured_token.strip():
-                # Separate explicit admin authorization:
-                # If admin_auth_token is explicitly configured and differs, this token does NOT grant admin!
+                # Shared coordinator token NEVER grants administrator access (Phase 10A)
                 is_admin = False
-                if not admin_configured_token and "admin" in configured_token.lower():
-                    is_admin = True
-
                 target_provider = x_provider_id.strip() if x_provider_id and x_provider_id.strip() else "default_provider"
                 return AuthenticatedPrincipal(
-                    principal_id="admin_token" if is_admin else "coordinator_token",
+                    principal_id="coordinator_token",
                     provider_id=target_provider,
-                    is_admin=is_admin,
-                    admin_override=is_admin and admin_override_requested,
+                    is_admin=False,
+                    admin_override=False,
                     auth_method="token",
                 )
             else:
@@ -219,61 +256,106 @@ def get_current_principal(
                     headers={"WWW-Authenticate": "Bearer"},
                 )
         else:
-            # Dev mode (no coordinator token configured)
+            # Missing configuration check
+            if settings.environment == "production":
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Unauthorized: Production coordinator authentication is not configured.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            # Dev mode (testing/local only)
             target_provider = x_provider_id.strip() if x_provider_id and x_provider_id.strip() else "default_provider"
             return AuthenticatedPrincipal(
                 principal_id="dev_user",
                 provider_id=target_provider,
-                is_admin=True,
-                admin_override=admin_override_requested,
+                is_admin=False,
+                admin_override=False,
                 auth_method="token",
             )
 
     # 2. Browser Session Cookie Check
     if session_cookie and session_cookie.strip():
+        # First check provider sessions
         session = session_manager.get_session(session_cookie.strip())
-        if not session:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unauthorized: Session expired or invalid.",
+        if session:
+            # CSRF defense on state-changing browser requests
+            if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+                if not x_csrf_token or x_csrf_token.strip() != session.csrf_token:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Forbidden: Invalid or missing CSRF token.",
+                    )
+
+            if x_provider_id and x_provider_id.strip():
+                requested_id = x_provider_id.strip()
+                if not session.is_admin and requested_id != session.provider_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail=f"Access denied: Principal '{session.provider_id}' is not authorized to act as provider '{requested_id}'.",
+                    )
+                target_provider = requested_id
+            else:
+                target_provider = session.provider_id
+
+            return AuthenticatedPrincipal(
+                principal_id=session.provider_id,
+                provider_id=target_provider,
+                is_admin=session.is_admin,
+                admin_override=session.is_admin and admin_override_requested,
+                auth_method="session",
+                csrf_token=session.csrf_token,
             )
 
-        # CSRF defense on state-changing browser requests
-        if request.method in ("POST", "PUT", "DELETE", "PATCH"):
-            if not x_csrf_token or x_csrf_token.strip() != session.csrf_token:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Forbidden: Invalid or missing CSRF token.",
-                )
+        # Then check account sessions
+        acc_session = account_manager.get_session(session_cookie.strip())
+        if acc_session:
+            if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+                if not x_csrf_token or x_csrf_token.strip() != acc_session.csrf_token:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Forbidden: Invalid or missing CSRF token.",
+                    )
 
-        if x_provider_id and x_provider_id.strip():
-            requested_id = x_provider_id.strip()
-            if not session.is_admin and requested_id != session.provider_id:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"Access denied: Principal '{session.provider_id}' is not authorized to act as provider '{requested_id}'.",
-                )
-            target_provider = requested_id
-        else:
-            target_provider = session.provider_id
+            if x_provider_id and x_provider_id.strip():
+                requested_id = x_provider_id.strip()
+                if not acc_session.is_admin and requested_id != acc_session.provider_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail=f"Access denied: Account '{acc_session.account_id}' is not authorized to act as provider '{requested_id}'.",
+                    )
+                target_provider = requested_id
+            else:
+                target_provider = acc_session.provider_id or "default_provider"
 
-        return AuthenticatedPrincipal(
-            principal_id=session.provider_id,
-            provider_id=target_provider,
-            is_admin=session.is_admin,
-            admin_override=session.is_admin and admin_override_requested,
-            auth_method="session",
-            csrf_token=session.csrf_token,
+            return AuthenticatedPrincipal(
+                principal_id=acc_session.account_id,
+                provider_id=target_provider,
+                account_id=acc_session.account_id,
+                is_admin=acc_session.is_admin,
+                admin_override=acc_session.is_admin and admin_override_requested,
+                auth_method="session",
+                csrf_token=acc_session.csrf_token,
+            )
+
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Session expired or invalid.",
         )
 
-    # 3. Dev mode if no token configured
+    # 3. No credentials provided: check configuration
     if not configured_token or not configured_token.strip():
+        if settings.environment == "production":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized: Production coordinator authentication is not configured.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         target_provider = x_provider_id.strip() if x_provider_id and x_provider_id.strip() else "default_provider"
         return AuthenticatedPrincipal(
             principal_id="dev_user",
             provider_id=target_provider,
-            is_admin=True,
-            admin_override=admin_override_requested,
+            is_admin=False,
+            admin_override=False,
             auth_method="token",
         )
 
@@ -287,6 +369,7 @@ def get_current_principal(
 
 def get_optional_principal(
     request: Request,
+    settings: Annotated[CoordinatorSettings, Depends(get_settings)],
     x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token"),
     authorization: Optional[str] = Header(None, alias="Authorization"),
     x_provider_id: Optional[str] = Header(None, alias="X-Provider-Id"),
@@ -298,6 +381,7 @@ def get_optional_principal(
     try:
         return get_current_principal(
             request=request,
+            settings=settings,
             x_auth_token=x_auth_token,
             authorization=authorization,
             x_provider_id=x_provider_id,
@@ -336,14 +420,22 @@ def verify_node_ownership(
         )
 
     admin_override = False
+    allowed_providers = set()
     if isinstance(principal_or_id, AuthenticatedPrincipal):
         admin_override = principal_or_id.is_admin and principal_or_id.admin_override
-        caller_provider = principal_or_id.provider_id
+        caller_provider = principal_or_id.provider_id or (f"provider-{principal_or_id.account_id}" if principal_or_id.account_id else "unknown")
+        if principal_or_id.provider_id:
+            allowed_providers.add(principal_or_id.provider_id)
+        if principal_or_id.account_id:
+            allowed_providers.add(principal_or_id.account_id)
+            allowed_providers.add(f"provider-{principal_or_id.account_id}")
     else:
         caller_provider = str(principal_or_id)
+        allowed_providers.add(caller_provider)
+        allowed_providers.add(f"provider-{caller_provider}")
 
     # Scoped provider check: caller cannot view or modify another provider's node without explicit admin override
-    if not admin_override and node.provider_id and node.provider_id != caller_provider:
+    if not admin_override and node.provider_id and node.provider_id not in allowed_providers and node.provider_id != "default_provider":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Access denied: Node '{clean_id}' does not belong to provider '{caller_provider}'.",
@@ -806,12 +898,11 @@ def session_login(
             )
         clean_provider = bound
         is_admin = False
-    elif admin_configured_token and admin_configured_token.strip() and provided_secret == admin_configured_token.strip():
-        is_admin = True
-        clean_provider = clean_provider or "admin"
-    elif configured_token and configured_token.strip() and provided_secret == configured_token.strip():
-        # Dedicated admin token check: shared coordinator token cannot be used to log in as ordinary providers (Req A.6)
-        if clean_provider == "admin" and not admin_configured_token:
+    elif (
+        (admin_configured_token and admin_configured_token.strip() and provided_secret == admin_configured_token.strip())
+        or (configured_token and configured_token.strip() and provided_secret == configured_token.strip())
+    ):
+        if (clean_provider == "admin" or not req.provider_id) and admin_configured_token and provided_secret == admin_configured_token.strip():
             is_admin = True
             clean_provider = "admin"
         else:
@@ -821,8 +912,12 @@ def session_login(
             )
     elif not configured_token:
         # Dev mode (no coordinator token configured)
-        if clean_provider == "admin" or provided_secret == "admin":
-            is_admin = True
+        if settings.environment == "production":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Production coordinator authentication is not configured.",
+            )
+        is_admin = False
     else:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -1220,7 +1315,255 @@ def cancel_node_drain(
 
 
 # =============================================================================
-# 5. Interactive Provider Dashboard (HTML5 SPA)
+# 5. Phase 10C: Provider Onboarding, Node Validation and Probation
+# =============================================================================
+
+@provider_router.post(
+    "/onboard",
+    response_model=ProviderOnboardResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Complete Provider Onboarding and Terms Acceptance",
+)
+def onboard_provider(
+    data: ProviderOnboardRequest,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    account_manager: AccountManager = Depends(get_account_manager),
+    settings: CoordinatorSettings = Depends(get_settings),
+) -> ProviderOnboardResponse:
+    """Records formal provider terms consent and verifies provider capabilities."""
+    if not data.accept_terms:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Terms and conditions must be explicitly accepted to onboard as a provider.",
+        )
+
+    # Verify that account exists and is active if authenticated via account
+    account = None
+    if principal.account_id:
+        account = account_manager.get_account(principal.account_id)
+        if not account:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Account '{principal.account_id}' not found.",
+            )
+        if account.status in ("suspended", "disabled", "inactive"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Account '{principal.account_id}' is {account.status}. Onboarding rejected.",
+            )
+        if getattr(settings, "require_email_verification", False) and not account.email_verified:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Email verification required. Please verify your email address to onboard as a provider.",
+            )
+
+    # Determine stable provider identity:
+    # If client passed provider_id, ensure non-admin cannot spoof another provider
+    if data.provider_id and data.provider_id.strip():
+        req_provider = data.provider_id.strip()
+        if not principal.is_admin and principal.provider_id != "default_provider" and req_provider != principal.provider_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Access denied: Not authorized to onboard as provider '{req_provider}'.",
+            )
+        provider_id = req_provider
+    elif principal.provider_id and principal.provider_id != "default_provider":
+        provider_id = principal.provider_id
+    elif principal.account_id:
+        provider_id = account.provider_id if (account and account.provider_id) else f"provider-{principal.account_id}"
+    else:
+        provider_id = "default_provider"
+
+    # Add 'provider' capability to the account if account exists
+    if account and "provider" not in account.capabilities:
+        new_caps = list(account.capabilities) + ["provider"]
+        account_manager.update_account_capabilities(account.account_id, new_caps)
+
+    now_str = datetime.now(timezone.utc).isoformat()
+    terms_ver = data.terms_version.strip() if (data.terms_version and data.terms_version.strip()) else settings.terms_version
+
+    # Persist consent and onboarding status in provider_onboarding
+    with get_db_connection(settings.db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO provider_onboarding (
+                provider_id, account_id, terms_version, terms_accepted_at, accepted_at, is_verified, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 1, 'active', ?, ?)
+            ON CONFLICT(provider_id) DO UPDATE SET
+                account_id = excluded.account_id,
+                terms_version = excluded.terms_version,
+                terms_accepted_at = excluded.terms_accepted_at,
+                accepted_at = excluded.accepted_at,
+                is_verified = 1,
+                status = 'active',
+                updated_at = excluded.updated_at
+            """,
+            (provider_id, principal.account_id, terms_ver, now_str, now_str, now_str, now_str),
+        )
+        if principal.account_id:
+            conn.execute(
+                "UPDATE accounts SET provider_id = ?, updated_at = ? WHERE account_id = ?",
+                (provider_id, now_str, principal.account_id),
+            )
+            conn.execute(
+                "UPDATE account_sessions SET provider_id = ? WHERE account_id = ?",
+                (provider_id, principal.account_id),
+            )
+        conn.commit()
+
+    return ProviderOnboardResponse(
+        provider_id=provider_id,
+        account_id=principal.account_id,
+        is_verified=True,
+        terms_version=terms_ver,
+        terms_accepted_at=now_str,
+        accepted_at=now_str,
+        status="active",
+        message="Provider onboarding and terms agreement completed successfully.",
+    )
+
+
+@provider_router.get(
+    "/onboarding",
+    response_model=ProviderOnboardResponse,
+    summary="Get Provider Onboarding Status",
+)
+def get_onboarding_status(
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    settings: CoordinatorSettings = Depends(get_settings),
+) -> ProviderOnboardResponse:
+    """Returns onboarding status and agreed terms version for the authenticated provider."""
+    provider_id = principal.provider_id
+    with get_db_connection(settings.db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM provider_onboarding WHERE provider_id = ? OR account_id = ?",
+            (provider_id, principal.account_id or ""),
+        ).fetchone()
+        if not row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Onboarding record not found for provider '{provider_id}'.",
+            )
+        acc_time = row["terms_accepted_at"] if ("terms_accepted_at" in row.keys() and row["terms_accepted_at"]) else (row["accepted_at"] if "accepted_at" in row.keys() else "")
+        verified = bool(row["is_verified"]) if "is_verified" in row.keys() else True
+        return ProviderOnboardResponse(
+            provider_id=row["provider_id"],
+            account_id=row["account_id"],
+            is_verified=verified,
+            terms_version=row["terms_version"],
+            terms_accepted_at=acc_time,
+            accepted_at=acc_time,
+            status=row["status"],
+            message="Provider onboarding is active.",
+        )
+
+
+@provider_router.post(
+    "/nodes/{node_id}/validate",
+    response_model=NodeValidationResponse,
+    summary="Run Storage Node Health and Integrity Validation",
+)
+def validate_node(
+    node_id: str,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    registry: NodeRegistry = Depends(get_registry),
+    settings: CoordinatorSettings = Depends(get_settings),
+) -> NodeValidationResponse:
+    """Executes non-destructive health, sandbox write/read, and cleanup checks on the target node."""
+    verify_node_ownership(node_id, principal, registry)
+    from coordinator.app.node_validation import NodeValidator
+    validator = NodeValidator(settings)
+    try:
+        result = validator.validate_node(node_id=node_id)
+        return result
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Validation error: {exc}",
+        )
+
+
+@provider_router.get(
+    "/nodes/{node_id}/validation",
+    response_model=ProviderNodeValidationHistoryResponse,
+    summary="Get Node Health Validation History",
+)
+def get_node_validation_history(
+    node_id: str,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    registry: NodeRegistry = Depends(get_registry),
+    settings: CoordinatorSettings = Depends(get_settings),
+) -> ProviderNodeValidationHistoryResponse:
+    """Retrieves full validation history and current probation status for a node."""
+    node = verify_node_ownership(node_id, principal, registry)
+    validator = NodeValidator(settings)
+    with get_db_connection(settings.db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM node_validation_records WHERE node_id = ? ORDER BY performed_at DESC LIMIT 50",
+            (node_id,),
+        ).fetchall()
+        records: List[NodeValidationResponse] = []
+        for r in rows:
+            checks_list = []
+            try:
+                raw_checks = json.loads(r["checks_performed"]) if r["checks_performed"] else []
+                for c in raw_checks:
+                    checks_list.append(NodeValidationCheckItem(**c))
+            except Exception:
+                pass
+            score = 0.0
+            try:
+                if r["details_json"]:
+                    dj = json.loads(r["details_json"])
+                    score = float(dj.get("reliability_score", node.reliability_score))
+            except Exception:
+                score = float(node.reliability_score)
+
+            records.append(
+                NodeValidationResponse(
+                    validation_id=r["validation_id"],
+                    node_id=r["node_id"],
+                    provider_id=r["provider_id"],
+                    status=r["status"],
+                    lifecycle_state=node.lifecycle_state,
+                    overall_status=r["status"],
+                    resulting_lifecycle_state=node.lifecycle_state,
+                    failure_reason=r["failure_reason"],
+                    reliability_score=score,
+                    checks=checks_list,
+                    performed_at=r["performed_at"],
+                    duration_ms=r["duration_ms"] or 0.0,
+                )
+            )
+
+    probation_status = validator.get_probation_status(node_id)
+    return ProviderNodeValidationHistoryResponse(
+        node_id=node.node_id,
+        probation_status=probation_status,
+        validations=records,
+        count=len(records),
+    )
+
+
+@provider_router.get(
+    "/nodes/{node_id}/probation",
+    response_model=NodeProbationStatusResponse,
+    summary="Get Node Probation Lifecycle Status",
+)
+def get_node_probation_status(
+    node_id: str,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    registry: NodeRegistry = Depends(get_registry),
+    settings: CoordinatorSettings = Depends(get_settings),
+) -> NodeProbationStatusResponse:
+    """Returns real-time probation metrics and promotion eligibility for a node."""
+    verify_node_ownership(node_id, principal, registry)
+    validator = NodeValidator(settings)
+    return validator.get_probation_status(node_id)
+
+
+# =============================================================================
+# 6. Interactive Provider Dashboard (HTML5 SPA)
 # =============================================================================
 
 @provider_router.get(
@@ -1231,7 +1574,8 @@ def cancel_node_drain(
 def serve_provider_dashboard() -> HTMLResponse:
     """Serves the rich, responsive, accessible Provider Monitoring & Management Dashboard."""
     from pathlib import Path
-    html_path = Path(__file__).parent / "static" / "index.html"
+    frontend_html = Path(__file__).resolve().parent.parent.parent / "frontend" / "index.html"
+    html_path = frontend_html if frontend_html.exists() else (Path(__file__).parent / "static" / "index.html")
     if html_path.exists():
         content = html_path.read_text(encoding="utf-8")
     else:

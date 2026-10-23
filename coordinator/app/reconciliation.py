@@ -120,9 +120,21 @@ class ReconciliationService:
                 # Cleanup orphaned files
                 for node_id, endpoint, file_id, orig in orphaned_files:
                     try:
+                        del_h = self._get_headers()
+                        if file_id and self.settings.effective_capability_secret:
+                            try:
+                                from coordinator.app.capability import issue_delete_capability
+                                del_h["X-Capability-Token"] = issue_delete_capability(
+                                    self.settings,
+                                    node_id=node_id or "*",
+                                    chunk_id=file_id,
+                                    account_id="system:coordinator",
+                                )
+                            except Exception:
+                                pass
                         del_res = httpx.delete(
                             f"{endpoint}/files/{file_id}",
-                            headers=self._get_headers(),
+                            headers=del_h,
                             timeout=httpx.Timeout(5.0, connect=3.0),
                         )
                         if del_res.status_code in (200, 204):
@@ -230,18 +242,28 @@ class ReconciliationService:
             
             success = False
             timeout_setting = httpx.Timeout(2.0, connect=1.0)
-            headers = self._get_headers()
-
+            del_headers = dict(self._get_headers())
+            if c_id and self.settings.effective_capability_secret:
+                try:
+                    from coordinator.app.capability import issue_delete_capability
+                    del_headers["X-Capability-Token"] = issue_delete_capability(
+                        self.settings,
+                        node_id=n_id or "*",
+                        chunk_id=c_id,
+                        account_id="system:coordinator",
+                    )
+                except Exception:
+                    pass
 
             for ep in candidate_endpoints:
                 try:
                     # Try direct deletion by c_id first
-                    del_direct = httpx.delete(f"{ep}/files/{c_id}", headers=headers, timeout=timeout_setting)
+                    del_direct = httpx.delete(f"{ep}/files/{c_id}", headers=del_headers, timeout=timeout_setting)
                     if del_direct.status_code in (200, 204, 404):
                         success = True
                         break
 
-                    res = httpx.get(f"{ep}/files", headers=headers, timeout=timeout_setting)
+                    res = httpx.get(f"{ep}/files", headers=del_headers, timeout=timeout_setting)
                     if res.status_code == 200:
                         found_file_id = None
                         node_files = res.json()
@@ -252,7 +274,7 @@ class ReconciliationService:
                                 found_file_id = nf.get("file_id")
                                 break
                         if found_file_id:
-                            del_res = httpx.delete(f"{ep}/files/{found_file_id}", headers=headers, timeout=timeout_setting)
+                            del_res = httpx.delete(f"{ep}/files/{found_file_id}", headers=del_headers, timeout=timeout_setting)
                             if del_res.status_code in (200, 204, 404):
                                 success = True
                                 break

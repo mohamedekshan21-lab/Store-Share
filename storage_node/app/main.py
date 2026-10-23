@@ -38,6 +38,16 @@ from storage_node.app.storage_manager import (
     StorageFileNotFoundError,
     ChecksumMismatchError,
 )
+from storage_node.app.capability import (
+    CapabilityToken,
+    CapabilityError,
+    InvalidCapabilitySignatureError,
+    ExpiredCapabilityError,
+    ScopeMismatchCapabilityError,
+    MalformedCapabilityError,
+    verify_capability,
+    extract_capability_from_request,
+)
 from storage_node.app.coordinator_integration import CoordinatorNotifier, RelayTunnelClient
 
 logger = logging.getLogger("expo_storage_node")
@@ -187,6 +197,125 @@ async def file_not_found_handler(request: Request, exc: StorageFileNotFoundError
     )
 
 
+@app.exception_handler(InvalidCapabilitySignatureError)
+async def invalid_cap_sig_handler(request: Request, exc: InvalidCapabilitySignatureError):
+    return JSONResponse(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content={"detail": str(exc)},
+    )
+
+
+@app.exception_handler(ExpiredCapabilityError)
+async def expired_cap_handler(request: Request, exc: ExpiredCapabilityError):
+    return JSONResponse(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        content={"detail": str(exc)},
+        headers={"WWW-Authenticate": "Bearer error=\"invalid_token\", error_description=\"token has expired\""},
+    )
+
+
+@app.exception_handler(ScopeMismatchCapabilityError)
+async def scope_mismatch_handler(request: Request, exc: ScopeMismatchCapabilityError):
+    return JSONResponse(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content={"detail": str(exc)},
+    )
+
+
+@app.exception_handler(MalformedCapabilityError)
+async def malformed_cap_handler(request: Request, exc: MalformedCapabilityError):
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={"detail": str(exc)},
+    )
+
+
+def authorize_chunk_operation(
+    request: Request,
+    op: str,
+    file_id: Optional[str],
+    settings: Settings,
+    manager: StorageManager,
+    x_capability_token: Optional[str] = None,
+    x_auth_token: Optional[str] = None,
+    authorization: Optional[str] = None,
+    cap_query: Optional[str] = None,
+) -> Optional[CapabilityToken]:
+    """
+    Validates per-chunk capability authorization for Storage Node chunk operations.
+    If a capability token is supplied, enforces signature, node scope, chunk scope, operation,
+    expiration, and replay prevention.
+    If no capability token is supplied, checks for internal coordinator or node authentication.
+    Fails closed in production if neither valid capability nor internal credentials exist.
+    """
+    token_str = extract_capability_from_request(
+        request,
+        x_capability_token=x_capability_token,
+        authorization=authorization,
+        cap_query=cap_query,
+    )
+
+    if token_str:
+        secret = settings.effective_capability_secret
+        if not secret:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized: Capability secret is not configured on storage node.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        # Constant-time signature & scope verification
+        cap = verify_capability(
+            token_str=token_str,
+            secret=secret,
+            expected_node_id=manager.node_id,
+            expected_chunk_id=file_id,
+            expected_op=op,
+        )
+
+        # Enforce replay protection on upload atomically before data write
+        if op == "upload":
+            if not manager.claim_upload_capability(cap.jti, cap.chunk_id, "upload", cap.exp):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Conflict: Capability token '{cap.jti}' has already been consumed / replayed.",
+                )
+
+        return cap
+
+    # No capability token presented: production strictly requires valid capability token
+    if settings.environment == "production":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Production storage operations require a valid capability token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # In non-production development mode, check internal coordinator / node authentication
+    client_token = None
+    if x_auth_token:
+        client_token = x_auth_token.strip()
+    elif authorization and authorization.lower().startswith("bearer "):
+        client_token = authorization[7:].strip()
+
+    valid_internal_tokens = [
+        t.strip() for t in (settings.auth_token, settings.coordinator_auth_token) if t and t.strip()
+    ]
+
+    if client_token and valid_internal_tokens and client_token in valid_internal_tokens:
+        return None
+
+    if not valid_internal_tokens:
+        # In non-production unconfigured development mode, allow unauthenticated access for legacy test fixtures
+        return None
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Unauthorized: Missing or invalid capability token or node authentication credential.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
 @app.get("/health", response_model=HealthResponse, response_model_exclude_none=True, tags=["Health"], summary="Storage Node Liveness Check")
 def health(
     settings: Annotated[Settings, Depends(get_app_settings)],
@@ -229,24 +358,55 @@ def get_storage_info(
     "/files",
     response_model=FileMetadata,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(verify_authentication)],
     tags=["Files"],
     summary="Upload a File to Storage Node",
 )
 async def upload_file(
+    request: Request,
     file: UploadFile = File(...),
     x_sha256_checksum: Optional[str] = Header(None, alias="X-SHA256-Checksum"),
-    manager: StorageManager = Depends(get_manager),
+    x_capability_token: Optional[str] = Header(None, alias="X-Capability-Token"),
+    x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    cap_query: Optional[str] = Query(None, alias="cap"),
+    settings: Annotated[Settings, Depends(get_app_settings)] = None,
+    manager: Annotated[StorageManager, Depends(get_manager)] = None,
 ) -> FileMetadata:
-    """Accepts a file upload, checks quota, verifies SHA-256 checksum if provided, and safely stores it."""
+    """Accepts a file upload, verifies upload capability, checks quota atomically, verifies SHA-256 checksum, and safely stores it."""
+    cap = authorize_chunk_operation(
+        request=request,
+        op="upload",
+        file_id=None,
+        settings=settings,
+        manager=manager,
+        x_capability_token=x_capability_token,
+        x_auth_token=x_auth_token,
+        authorization=authorization,
+        cap_query=cap_query,
+    )
+
+    target_file_id = cap.chunk_id if cap else None
+    expected_size = cap.expected_size if cap else None
+    expected_sha256 = cap.expected_sha256 if (cap and cap.expected_sha256) else x_sha256_checksum
+
     try:
         metadata = manager.save_file(
             file_obj=file.file,
             original_filename=file.filename,
             content_type=file.content_type,
-            expected_sha256=x_sha256_checksum,
+            expected_sha256=expected_sha256,
+            file_id=target_file_id,
+            expected_size=expected_size,
         )
+
+        if cap:
+            manager.record_consumed_capability(cap.jti, metadata.file_id, "upload", cap.exp)
+
         return metadata
+    except Exception:
+        if cap:
+            manager.release_consumed_capability(cap.jti)
+        raise
     finally:
         await file.close()
 
@@ -254,29 +414,87 @@ async def upload_file(
 @app.get(
     "/files",
     response_model=List[FileMetadata],
-    dependencies=[Depends(verify_authentication)],
     tags=["Files"],
     summary="List Stored Files",
 )
 def list_files(
-    manager: Annotated[StorageManager, Depends(get_manager)]
+    request: Request,
+    settings: Annotated[Settings, Depends(get_app_settings)],
+    manager: Annotated[StorageManager, Depends(get_manager)],
+    x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    x_capability_token: Optional[str] = Header(None, alias="X-Capability-Token"),
 ) -> List[FileMetadata]:
-    """Returns metadata for all files stored in the node's sandbox."""
-    file_list = manager.list_files()
-    return file_list.files
+    """
+    Returns metadata for all files stored in the node's sandbox.
+    Strictly restricted to internal coordinator/node administration.
+    Ordinary capability tokens cannot enumerate stored chunks.
+    """
+    if x_capability_token or request.headers.get("X-Capability-Token"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Capability tokens do not authorize chunk enumeration.",
+        )
+
+    client_token = None
+    if x_auth_token:
+        client_token = x_auth_token.strip()
+    elif authorization and authorization.lower().startswith("bearer "):
+        client_token = authorization[7:].strip()
+
+    valid_internal_tokens = [
+        t.strip() for t in (settings.auth_token, settings.coordinator_auth_token) if t and t.strip()
+    ]
+
+    if client_token and valid_internal_tokens and client_token in valid_internal_tokens:
+        file_list = manager.list_files()
+        return file_list.files
+
+    if not valid_internal_tokens:
+        if settings.environment == "production":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized: Production storage enumeration is restricted.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        file_list = manager.list_files()
+        return file_list.files
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Unauthorized: Chunk listing requires internal administrator or coordinator credentials.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 @app.get(
     "/files/{file_id}",
-    dependencies=[Depends(verify_authentication)],
     tags=["Files"],
     summary="Download / Retrieve Stored File",
 )
 def get_file(
     file_id: str,
+    request: Request,
+    settings: Annotated[Settings, Depends(get_app_settings)],
     manager: Annotated[StorageManager, Depends(get_manager)],
+    x_capability_token: Optional[str] = Header(None, alias="X-Capability-Token"),
+    x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    cap_query: Optional[str] = Query(None, alias="cap"),
 ):
-    """Retrieves a stored file by file_id if valid and contained inside the sandbox. Returns X-SHA256-Checksum header."""
+    """Retrieves a stored file by file_id after verifying download capability or coordinator auth."""
+    authorize_chunk_operation(
+        request=request,
+        op="download",
+        file_id=file_id,
+        settings=settings,
+        manager=manager,
+        x_capability_token=x_capability_token,
+        x_auth_token=x_auth_token,
+        authorization=authorization,
+        cap_query=cap_query,
+    )
+
     metadata, file_path = manager.get_file(file_id)
     headers = {}
     if metadata.sha256:
@@ -292,14 +510,31 @@ def get_file(
 
 @app.delete(
     "/files/{file_id}",
-    dependencies=[Depends(verify_authentication)],
     tags=["Files"],
     summary="Delete Stored File",
 )
 def delete_file(
     file_id: str,
+    request: Request,
+    settings: Annotated[Settings, Depends(get_app_settings)],
     manager: Annotated[StorageManager, Depends(get_manager)],
+    x_capability_token: Optional[str] = Header(None, alias="X-Capability-Token"),
+    x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    cap_query: Optional[str] = Query(None, alias="cap"),
 ):
-    """Deletes a stored file and its metadata from the storage node."""
+    """Deletes a stored file and its metadata from the storage node after verifying delete capability."""
+    authorize_chunk_operation(
+        request=request,
+        op="delete",
+        file_id=file_id,
+        settings=settings,
+        manager=manager,
+        x_capability_token=x_capability_token,
+        x_auth_token=x_auth_token,
+        authorization=authorization,
+        cap_query=cap_query,
+    )
+
     manager.delete_file(file_id)
     return {"status": "deleted", "file_id": file_id}

@@ -51,6 +51,7 @@ def test_settings(tmp_path: Path) -> CoordinatorSettings:
     return CoordinatorSettings(
         db_path=db_file,
         auth_token="phase8b-master-admin-token",
+        admin_auth_token="phase8b-master-admin-token",
         heartbeat_timeout_seconds=5,
     )
 

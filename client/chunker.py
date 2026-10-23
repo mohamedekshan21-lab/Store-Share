@@ -26,6 +26,7 @@ class ChunkPlacement(BaseModel):
     node_endpoint: str = Field(..., description="Storage Node endpoint URL hosting this copy")
     role: str = Field(default="PRIMARY", description="Placement role ('PRIMARY' or 'REPLICA')")
     chunk_id: Optional[str] = Field(default=None, description="Storage Node local file_id for this chunk copy")
+    capability: Optional[str] = Field(default=None, description="Signed capability token for chunk access")
 
 
 class ShardMetadata(BaseModel):
@@ -38,6 +39,7 @@ class ShardMetadata(BaseModel):
     shard_sha256: str = Field(..., description="SHA-256 integrity checksum of shard payload")
     node_id: str = Field(..., description="Storage Node ID hosting this shard")
     node_endpoint: str = Field(..., description="Storage Node endpoint URL hosting this shard")
+    capability: Optional[str] = Field(default=None, description="Signed capability token for shard access")
 
 
 class ChunkMetadata(BaseModel):

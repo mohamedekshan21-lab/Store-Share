@@ -59,6 +59,7 @@ class CoordinatorNotifier:
                 advertised_endpoint=adv_endpoint,
                 connectivity_mode=self.settings.connectivity_mode,
                 protocol_version=self.settings.protocol_version,
+                provider_id=self.settings.provider_id,
                 total_capacity_bytes=storage_info.quota_bytes,
                 used_capacity_bytes=storage_info.used_bytes,
                 available_capacity_bytes=storage_info.available_bytes,

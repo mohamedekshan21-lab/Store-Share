@@ -217,6 +217,7 @@ def _download_chunk_from_endpoint(
     n_endpoint: Optional[str],
     node_id: Optional[str] = None,
     coordinator_url: Optional[str] = None,
+    capability_token: Optional[str] = None,
 ) -> bytes:
     """Safely downloads chunk bytes from a specific node endpoint, preserving client.base_url."""
     if not n_endpoint or n_endpoint == getattr(client, "base_url", None) or hasattr(client, "nodes_info") or hasattr(client, "node_map") or type(client) is not ExpoClient:
@@ -224,6 +225,11 @@ def _download_chunk_from_endpoint(
         try:
             if n_endpoint:
                 client.base_url = n_endpoint
+            if capability_token:
+                try:
+                    return client.download_chunk_bytes(chunk_id, capability_token=capability_token)
+                except TypeError:
+                    return client.download_chunk_bytes(chunk_id)
             return client.download_chunk_bytes(chunk_id)
         finally:
             if orig_url is not None:
@@ -233,6 +239,11 @@ def _download_chunk_from_endpoint(
             node_client = client.get_node_client(node_id, endpoint=n_endpoint, coordinator_url=coordinator_url)
         else:
             node_client = ExpoClient(node_url=n_endpoint, auth_token=client.auth_token, timeout=client.timeout)
+        if capability_token:
+            try:
+                return node_client.download_chunk_bytes(chunk_id, capability_token=capability_token)
+            except TypeError:
+                return node_client.download_chunk_bytes(chunk_id)
         return node_client.download_chunk_bytes(chunk_id)
 
 
@@ -243,6 +254,7 @@ def _upload_chunk_to_endpoint(
     n_endpoint: Optional[str],
     node_id: Optional[str] = None,
     coordinator_url: Optional[str] = None,
+    capability_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Safely uploads chunk bytes to a specific node endpoint, preserving client.base_url."""
     if not n_endpoint or n_endpoint == getattr(client, "base_url", None) or hasattr(client, "nodes_info") or hasattr(client, "node_map") or type(client) is not ExpoClient:
@@ -250,6 +262,11 @@ def _upload_chunk_to_endpoint(
         try:
             if n_endpoint:
                 client.base_url = n_endpoint
+            if capability_token:
+                try:
+                    return client.upload_chunk_bytes(chunk_bytes, opaque_filename, capability_token=capability_token)
+                except TypeError:
+                    return client.upload_chunk_bytes(chunk_bytes, opaque_filename)
             return client.upload_chunk_bytes(chunk_bytes, opaque_filename)
         finally:
             if orig_url is not None:
@@ -259,6 +276,11 @@ def _upload_chunk_to_endpoint(
             node_client = client.get_node_client(node_id, endpoint=n_endpoint, coordinator_url=coordinator_url)
         else:
             node_client = ExpoClient(node_url=n_endpoint, auth_token=client.auth_token, timeout=client.timeout)
+        if capability_token:
+            try:
+                return node_client.upload_chunk_bytes(chunk_bytes, opaque_filename, capability_token=capability_token)
+            except TypeError:
+                return node_client.upload_chunk_bytes(chunk_bytes, opaque_filename)
         return node_client.upload_chunk_bytes(chunk_bytes, opaque_filename)
 
 
@@ -268,6 +290,7 @@ def _delete_file_from_endpoint(
     n_endpoint: Optional[str],
     node_id: Optional[str] = None,
     coordinator_url: Optional[str] = None,
+    capability_token: Optional[str] = None,
 ) -> None:
     """Safely deletes a chunk from a specific node endpoint, preserving client.base_url."""
     if not n_endpoint or n_endpoint == getattr(client, "base_url", None) or hasattr(client, "nodes_info") or hasattr(client, "node_map") or type(client) is not ExpoClient:
@@ -275,7 +298,13 @@ def _delete_file_from_endpoint(
         try:
             if n_endpoint:
                 client.base_url = n_endpoint
-            client.delete_file(file_id)
+            if capability_token:
+                try:
+                    client.delete_file(file_id, capability_token=capability_token)
+                except TypeError:
+                    client.delete_file(file_id)
+            else:
+                client.delete_file(file_id)
         finally:
             if orig_url is not None:
                 client.base_url = orig_url
@@ -284,7 +313,13 @@ def _delete_file_from_endpoint(
             node_client = client.get_node_client(node_id, endpoint=n_endpoint, coordinator_url=coordinator_url)
         else:
             node_client = ExpoClient(node_url=n_endpoint, auth_token=client.auth_token, timeout=client.timeout)
-        node_client.delete_file(file_id)
+        if capability_token:
+            try:
+                node_client.delete_file(file_id, capability_token=capability_token)
+            except TypeError:
+                node_client.delete_file(file_id)
+        else:
+            node_client.delete_file(file_id)
 
 
 

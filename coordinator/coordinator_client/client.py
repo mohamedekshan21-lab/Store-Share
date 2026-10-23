@@ -298,12 +298,30 @@ class CoordinatorClient:
         except httpx.HTTPError as exc:
             raise CoordinatorClientError(f"Get logical file network error: {str(exc)}") from exc
 
-    def delete_logical_file(self, file_id: str, finalize: bool = False) -> Dict[str, Any]:
+    def get_file_status(self, file_id: str) -> Dict[str, Any]:
+        """Retrieves physical storage health and degradation status for a logical file."""
+        try:
+            res = self._request("GET", f"/catalog/files/{file_id}/status")
+            res.raise_for_status()
+            return res.json()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise CoordinatorClientError(f"Logical file not found (404): ID '{file_id}'") from exc
+            raise CoordinatorClientError(f"Get file status failed ({exc.response.status_code}): {exc.response.text}") from exc
+        except httpx.HTTPError as exc:
+            raise CoordinatorClientError(f"Get file status network error: {str(exc)}") from exc
+
+    def delete_logical_file(self, file_id: str, finalize: bool = False, sync_cleanup: bool = False) -> Dict[str, Any]:
         """Marks a logical file for deletion in the catalog, or marks it fully deleted if finalize=True."""
         try:
             url = f"/catalog/files/{file_id}"
+            params = []
             if finalize:
-                url += "?finalize=true"
+                params.append("finalize=true")
+            if sync_cleanup:
+                params.append("sync_cleanup=true")
+            if params:
+                url += "?" + "&".join(params)
             res = self._request("DELETE", url)
             res.raise_for_status()
             return res.json()
@@ -313,6 +331,53 @@ class CoordinatorClient:
             raise CoordinatorClientError(f"Delete logical file failed ({exc.response.status_code}): {exc.response.text}") from exc
         except httpx.HTTPError as exc:
             raise CoordinatorClientError(f"Delete logical file network error: {str(exc)}") from exc
+
+    # Phase 10D: Quota Operations
+
+    def get_quota(self) -> Dict[str, Any]:
+        """Retrieves storage quota, committed usage, reservations, and availability for the authenticated account."""
+        try:
+            res = self._request("GET", "/catalog/quota")
+            res.raise_for_status()
+            return res.json()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 401:
+                raise CoordinatorClientError("Authentication failed: Missing or invalid token.") from exc
+            raise CoordinatorClientError(f"Get quota failed ({exc.response.status_code}): {exc.response.text}") from exc
+        except httpx.HTTPError as exc:
+            raise CoordinatorClientError(f"Get quota network error: {str(exc)}") from exc
+
+    def reserve_quota(self, expected_bytes: int, file_id: Optional[str] = None, ttl_seconds: Optional[int] = None) -> Dict[str, Any]:
+        """Atomically reserves account storage quota before uploading."""
+        payload: Dict[str, Any] = {"expected_bytes": expected_bytes}
+        if file_id:
+            payload["file_id"] = file_id
+        if ttl_seconds:
+            payload["ttl_seconds"] = ttl_seconds
+        try:
+            res = self._request("POST", "/catalog/quota/reserve", json=payload)
+            res.raise_for_status()
+            return res.json()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 403:
+                raise CoordinatorClientError(f"Quota exceeded (403): {exc.response.text}") from exc
+            raise CoordinatorClientError(f"Reserve quota failed ({exc.response.status_code}): {exc.response.text}") from exc
+        except httpx.HTTPError as exc:
+            raise CoordinatorClientError(f"Reserve quota network error: {str(exc)}") from exc
+
+    def release_quota(self, reservation_id: Optional[str] = None, file_id: Optional[str] = None) -> Dict[str, Any]:
+        """Releases an active quota reservation upon failure or abort."""
+        payload: Dict[str, Any] = {}
+        if reservation_id:
+            payload["reservation_id"] = reservation_id
+        if file_id:
+            payload["file_id"] = file_id
+        try:
+            res = self._request("POST", "/catalog/quota/release", json=payload)
+            res.raise_for_status()
+            return res.json()
+        except httpx.HTTPError as exc:
+            raise CoordinatorClientError(f"Release quota network error: {str(exc)}") from exc
 
     # Phase 7A: Metering Methods
 

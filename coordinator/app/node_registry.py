@@ -87,7 +87,11 @@ class InvalidCapacityError(NodeRegistryError, ValueError):
 
 VALID_CONNECTIVITY_MODES = {"LAN", "DIRECT", "RELAY", "UNKNOWN"}
 VALID_STATUSES = {
+    "registered",
+    "validation_in_progress",
+    "probation",
     "online",
+    "unhealthy",
     "offline",
     "connecting",
     "degraded",
@@ -117,8 +121,11 @@ class NodeRegistry:
             return datetime.now(timezone.utc)
 
     def _compute_node_status(self, raw_status: str, last_seen_str: str) -> str:
-        """Calculates current node status based on configured heartbeat timeout."""
+        """Calculates current node status based on configured heartbeat timeout and preserved states."""
         clean_status = raw_status.lower() if raw_status else "online"
+        # Preserved non-serving statuses that do not automatically transition based on elapsed time:
+        if clean_status in ("disabled", "draining", "drain_blocked", "drained", "registered", "validation_in_progress", "unhealthy"):
+            return clean_status
         last_seen_dt = self._parse_iso_datetime(last_seen_str)
         now_dt = datetime.now(timezone.utc)
         elapsed = (now_dt - last_seen_dt).total_seconds()
@@ -126,6 +133,50 @@ class NodeRegistry:
         if elapsed > self.settings.heartbeat_timeout_seconds:
             return "offline"
         return clean_status if clean_status in VALID_STATUSES else "online"
+
+    def _row_to_node_record(self, row: sqlite3.Row, computed_status: Optional[str] = None) -> NodeRecord:
+        """Constructs a fully populated NodeRecord with all Phase 10C fields from a SQLite row."""
+        row_keys = set(row.keys())
+        status_raw = row["status"] if "status" in row_keys else "online"
+        last_seen_str = row["last_seen"] if "last_seen" in row_keys else datetime.now(timezone.utc).isoformat()
+        if computed_status is None:
+            computed_status = self._compute_node_status(status_raw, last_seen_str)
+
+        raw_lifecycle = row["lifecycle_state"] if ("lifecycle_state" in row_keys and row["lifecycle_state"]) else None
+        if not raw_lifecycle:
+            lifecycle_state = "online" if computed_status == "online" else "registered"
+        else:
+            lifecycle_state = raw_lifecycle
+
+        return NodeRecord(
+            node_id=row["node_id"],
+            host=row["host"],
+            port=row["port"],
+            endpoint=row["endpoint"],
+            advertised_endpoint=row["advertised_endpoint"] or row["endpoint"],
+            status=computed_status,
+            connectivity_mode=(row["connectivity_mode"] or "LAN").upper(),
+            protocol_version=row["protocol_version"] or "2B",
+            total_capacity_bytes=row["total_capacity_bytes"],
+            used_capacity_bytes=row["used_capacity_bytes"],
+            available_capacity_bytes=row["available_capacity_bytes"],
+            last_seen=last_seen_str,
+            registered_at=row["registered_at"] if "registered_at" in row_keys else last_seen_str,
+            provider_id=row["provider_id"] if ("provider_id" in row_keys and row["provider_id"]) else "default_provider",
+            is_schedulable=bool(row["is_schedulable"]) if ("is_schedulable" in row_keys and row["is_schedulable"] is not None) else True,
+            drain_status=row["drain_status"] if ("drain_status" in row_keys and row["drain_status"]) else "none",
+            lifecycle_state=lifecycle_state,
+            probation_started_at=row["probation_started_at"] if "probation_started_at" in row_keys else None,
+            promoted_at=row["promoted_at"] if "promoted_at" in row_keys else None,
+            health_check_success_count=int(row["health_check_success_count"] or 0) if "health_check_success_count" in row_keys else 0,
+            health_check_fail_count=int(row["health_check_fail_count"] or 0) if "health_check_fail_count" in row_keys else 0,
+            consecutive_failures=int(row["consecutive_failures"] or 0) if "consecutive_failures" in row_keys else 0,
+            last_health_check_at=row["last_health_check_at"] if "last_health_check_at" in row_keys else None,
+            last_health_check_status=row["last_health_check_status"] if "last_health_check_status" in row_keys else None,
+            last_health_check_error=row["last_health_check_error"] if "last_health_check_error" in row_keys else None,
+            reliability_score=float(row["reliability_score"] or 0.0) if "reliability_score" in row_keys else 0.0,
+            probation_placed_bytes=int(row["probation_placed_bytes"] or 0) if "probation_placed_bytes" in row_keys else 0,
+        )
 
     def _validate_and_normalize_capacity(
         self,
@@ -217,9 +268,21 @@ class NodeRegistry:
         provider_id = (getattr(data, "provider_id", None) or kwargs.get("provider_id") or "default_provider").strip()
         is_schedulable = 1 if (getattr(data, "is_schedulable", True) if getattr(data, "is_schedulable", None) is not None else kwargs.get("is_schedulable", True)) else 0
 
+        # Check whether provider account is suspended or disabled
+        with get_db_connection(self.db_path) as conn:
+            act_row = conn.execute(
+                "SELECT status FROM accounts WHERE provider_id = ? OR account_id = ?",
+                (provider_id, provider_id),
+            ).fetchone()
+            if act_row and act_row["status"] in ("suspended", "disabled", "inactive"):
+                raise ValueError(f"Provider account '{provider_id}' is {act_row['status']}. Registration rejected.")
+
+        explicit_lifecycle = getattr(data, "lifecycle_state", None) or kwargs.get("lifecycle_state")
+        explicit_status = getattr(data, "status", None) or kwargs.get("status")
+
         with get_db_connection(self.db_path) as conn:
             cursor = conn.execute(
-                "SELECT node_id, registered_at, total_capacity_bytes, provider_id, is_schedulable FROM nodes WHERE node_id = ?",
+                "SELECT node_id, registered_at, total_capacity_bytes, provider_id, is_schedulable, lifecycle_state, status FROM nodes WHERE node_id = ?",
                 (node_id,),
             )
             existing = cursor.fetchone()
@@ -235,7 +298,24 @@ class NodeRegistry:
             if existing:
                 registered_at = existing["registered_at"]
                 node_provider = existing["provider_id"] or provider_id
+                # Enforce ownership: cannot update node identity belonging to another provider
+                if existing["provider_id"] and existing["provider_id"] != "default_provider":
+                    if provider_id and provider_id != "default_provider" and provider_id != existing["provider_id"]:
+                        raise ValueError(
+                            f"Access denied: Node '{node_id}' is already registered to provider '{existing['provider_id']}'."
+                        )
                 node_sched = existing["is_schedulable"] if existing["is_schedulable"] is not None else is_schedulable
+                current_lifecycle = existing["lifecycle_state"] if ("lifecycle_state" in existing.keys() and existing["lifecycle_state"]) else "registered"
+                if explicit_lifecycle:
+                    node_lifecycle = explicit_lifecycle.strip().lower()
+                else:
+                    node_lifecycle = current_lifecycle
+
+                if explicit_status:
+                    node_status = explicit_status.strip().lower()
+                else:
+                    node_status = "online" if node_lifecycle in ("online", "probation") else node_lifecycle
+
                 conn.execute(
                     """
                     UPDATE nodes
@@ -243,7 +323,7 @@ class NodeRegistry:
                         port = ?,
                         endpoint = ?,
                         advertised_endpoint = ?,
-                        status = 'online',
+                        status = ?,
                         connectivity_mode = ?,
                         protocol_version = ?,
                         total_capacity_bytes = ?,
@@ -251,7 +331,8 @@ class NodeRegistry:
                         available_capacity_bytes = ?,
                         last_seen = ?,
                         provider_id = ?,
-                        is_schedulable = ?
+                        is_schedulable = ?,
+                        lifecycle_state = ?
                     WHERE node_id = ?
                     """,
                     (
@@ -259,6 +340,7 @@ class NodeRegistry:
                         port,
                         endpoint,
                         adv_endpoint,
+                        node_status,
                         connectivity,
                         protocol,
                         total_bytes,
@@ -267,6 +349,7 @@ class NodeRegistry:
                         now_str,
                         node_provider,
                         node_sched,
+                        node_lifecycle,
                         node_id,
                     ),
                 )
@@ -274,14 +357,35 @@ class NodeRegistry:
                 registered_at = now_str
                 node_provider = provider_id
                 node_sched = is_schedulable
+
+                if explicit_lifecycle:
+                    node_lifecycle = explicit_lifecycle.strip().lower()
+                    node_status = explicit_status.strip().lower() if explicit_status else ("online" if node_lifecycle in ("online", "probation") else node_lifecycle)
+                elif explicit_status and explicit_status.strip().lower() in ("registered", "validation_in_progress", "probation", "unhealthy"):
+                    node_status = explicit_status.strip().lower()
+                    node_lifecycle = node_status
+                elif self.settings.environment == "production":
+                    # Phase 10C requirement: in production, newly registered nodes must begin in registered state
+                    node_lifecycle = "registered"
+                    node_status = "registered"
+                elif getattr(data, "_from_account_session", False) or kwargs.get("_from_account_session", False):
+                    # Provider account session registration
+                    node_lifecycle = "registered"
+                    node_status = "registered"
+                else:
+                    # Testing / non-production coordinator registration defaults to online for backward compatibility
+                    node_lifecycle = "online"
+                    node_status = "online"
+
                 conn.execute(
                     """
                     INSERT INTO nodes (
                         node_id, host, port, endpoint, advertised_endpoint, status,
                         connectivity_mode, protocol_version,
                         total_capacity_bytes, used_capacity_bytes, available_capacity_bytes,
-                        last_seen, registered_at, provider_id, is_schedulable
-                    ) VALUES (?, ?, ?, ?, ?, 'online', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        last_seen, registered_at, provider_id, is_schedulable,
+                        lifecycle_state
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         node_id,
@@ -289,6 +393,7 @@ class NodeRegistry:
                         port,
                         endpoint,
                         adv_endpoint,
+                        node_status,
                         connectivity,
                         protocol,
                         total_bytes,
@@ -298,6 +403,7 @@ class NodeRegistry:
                         registered_at,
                         node_provider,
                         node_sched,
+                        node_lifecycle,
                     ),
                 )
 
@@ -309,7 +415,7 @@ class NodeRegistry:
             metering = MeteringService(self.settings)
             metering.record_heartbeat_observation(
                 node_id=node_id,
-                reported_status="online",
+                reported_status=node_status,
                 observed_at=now_str,
             )
             metering.record_capacity_snapshot(
@@ -325,24 +431,7 @@ class NodeRegistry:
         except Exception:
             pass
 
-        return NodeRecord(
-            node_id=node_id,
-            host=host,
-            port=port,
-            endpoint=endpoint,
-            advertised_endpoint=adv_endpoint,
-            status="online",
-            connectivity_mode=connectivity,
-            protocol_version=protocol,
-            total_capacity_bytes=total_bytes,
-            used_capacity_bytes=used_bytes,
-            available_capacity_bytes=avail_bytes,
-            last_seen=now_str,
-            registered_at=registered_at,
-            provider_id=node_provider,
-            is_schedulable=bool(node_sched),
-            drain_status="none",
-        )
+        return self.get_node(node_id)
 
     def heartbeat(self, node_id: str, data: NodeHeartbeatRequest) -> NodeRecord:
         """Processes a liveness heartbeat and optional capacity/connectivity updates for a registered node."""
@@ -376,9 +465,18 @@ class NodeRegistry:
                 new_used = row["used_capacity_bytes"]
                 new_avail = row["available_capacity_bytes"]
 
-            new_status = (data.status.lower() if data.status else "online")
-            if new_status not in VALID_STATUSES:
+            existing_lifecycle = row["lifecycle_state"] if ("lifecycle_state" in row.keys() and row["lifecycle_state"]) else "registered"
+            if existing_lifecycle in ("registered", "validation_in_progress", "unhealthy"):
+                # A raw heartbeat cannot promote unvalidated or unhealthy nodes
+                new_status = existing_lifecycle
+            elif existing_lifecycle == "disabled":
+                new_status = "disabled"
+            elif existing_lifecycle == "probation":
                 new_status = "online"
+            else:
+                new_status = (data.status.lower() if data.status else "online")
+                if new_status not in VALID_STATUSES:
+                    new_status = "online"
 
             new_connectivity = (data.connectivity_mode.strip().upper() if data.connectivity_mode else row["connectivity_mode"])
             if new_connectivity not in VALID_CONNECTIVITY_MODES:
@@ -435,23 +533,7 @@ class NodeRegistry:
         except Exception:
             pass
 
-        return NodeRecord(
-                node_id=clean_node_id,
-                host=row["host"],
-                port=row["port"],
-                endpoint=new_endpoint,
-                advertised_endpoint=new_adv_endpoint,
-                status=new_status,
-                connectivity_mode=new_connectivity,
-                protocol_version=new_protocol,
-                total_capacity_bytes=new_total,
-                used_capacity_bytes=new_used,
-                available_capacity_bytes=new_avail,
-                last_seen=heartbeat_timestamp,
-                registered_at=row["registered_at"],
-                provider_id=row["provider_id"] if "provider_id" in row.keys() and row["provider_id"] else "default_provider",
-                is_schedulable=bool(row["is_schedulable"]) if "is_schedulable" in row.keys() and row["is_schedulable"] is not None else True,
-            )
+        return self.get_node(clean_node_id)
 
     def get_node(self, node_id: str) -> Optional[NodeRecord]:
         """Retrieves record for a specific node with evaluated heartbeat status."""
@@ -474,24 +556,7 @@ class NodeRegistry:
                 )
                 conn.commit()
 
-            return NodeRecord(
-                node_id=row["node_id"],
-                host=row["host"],
-                port=row["port"],
-                endpoint=row["endpoint"],
-                advertised_endpoint=row["advertised_endpoint"] or row["endpoint"],
-                status=computed_status,
-                connectivity_mode=row["connectivity_mode"] or "LAN",
-                protocol_version=row["protocol_version"] or "2B",
-                total_capacity_bytes=row["total_capacity_bytes"],
-                used_capacity_bytes=row["used_capacity_bytes"],
-                available_capacity_bytes=row["available_capacity_bytes"],
-                last_seen=row["last_seen"],
-                registered_at=row["registered_at"],
-                provider_id=row["provider_id"] if "provider_id" in row.keys() and row["provider_id"] else "default_provider",
-                is_schedulable=bool(row["is_schedulable"]) if "is_schedulable" in row.keys() and row["is_schedulable"] is not None else True,
-                drain_status=row["drain_status"] if "drain_status" in row.keys() and row["drain_status"] else "none",
-            )
+            return self._row_to_node_record(row, computed_status)
 
     def list_nodes(
         self,
@@ -530,26 +595,7 @@ class NodeRegistry:
                     if avail_bytes < min_available_bytes:
                         continue
 
-                results.append(
-                    NodeRecord(
-                        node_id=row["node_id"],
-                        host=row["host"],
-                        port=row["port"],
-                        endpoint=row["endpoint"],
-                        advertised_endpoint=row["advertised_endpoint"] or row["endpoint"],
-                        status=computed_status,
-                        connectivity_mode=conn_mode,
-                        protocol_version=row["protocol_version"] or "2B",
-                        total_capacity_bytes=row["total_capacity_bytes"],
-                        used_capacity_bytes=row["used_capacity_bytes"],
-                        available_capacity_bytes=avail_bytes,
-                        last_seen=row["last_seen"],
-                        registered_at=row["registered_at"],
-                        provider_id=row["provider_id"] if "provider_id" in row.keys() and row["provider_id"] else "default_provider",
-                        is_schedulable=bool(row["is_schedulable"]) if "is_schedulable" in row.keys() and row["is_schedulable"] is not None else True,
-                        drain_status=row["drain_status"] if "drain_status" in row.keys() and row["drain_status"] else "none",
-                    )
-                )
+                results.append(self._row_to_node_record(row, computed_status))
 
             conn.commit()
             return results
@@ -560,7 +606,7 @@ class NodeRegistry:
         online_only: bool = True,
         preferred_connectivity: Optional[str] = None,
     ) -> Optional[NodeRecord]:
-        """Smart node selection algorithm: selects best eligible node based on capacity and connectivity."""
+        """Smart node selection algorithm: selects best eligible node based on capacity, connectivity, and reliability."""
         status_filter = "online" if online_only else None
         candidates = self.list_nodes(
             status_filter=status_filter,
@@ -570,19 +616,111 @@ class NodeRegistry:
         if not candidates:
             return None
 
-        # Filter out nodes that have scheduling disabled or are draining/disabled
-        schedulable_candidates = [c for c in candidates if c.is_schedulable and c.status == "online"]
+        # Pre-fetch suspended/disabled providers
+        suspended_providers = set()
+        try:
+            with get_db_connection(self.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT provider_id, account_id FROM accounts WHERE status IN ('suspended', 'disabled', 'inactive')"
+                ).fetchall()
+                for r in rows:
+                    if r["provider_id"]:
+                        suspended_providers.add(r["provider_id"])
+                    if r["account_id"]:
+                        suspended_providers.add(r["account_id"])
+                        suspended_providers.add(f"provider-{r['account_id']}")
+
+                # Also check provider_onboarding
+                rows_po = conn.execute(
+                    "SELECT provider_id FROM provider_onboarding WHERE status IN ('suspended', 'disabled', 'inactive')"
+                ).fetchall()
+                for r in rows_po:
+                    if r["provider_id"]:
+                        suspended_providers.add(r["provider_id"])
+
+                # Also join provider_onboarding accounts with suspended accounts
+                rows_po_acc = conn.execute(
+                    """
+                    SELECT po.provider_id FROM provider_onboarding po
+                    JOIN accounts a ON po.account_id = a.account_id
+                    WHERE a.status IN ('suspended', 'disabled', 'inactive')
+                    """
+                ).fetchall()
+                for r in rows_po_acc:
+                    if r["provider_id"]:
+                        suspended_providers.add(r["provider_id"])
+        except Exception:
+            pass
+
+        schedulable_candidates: List[NodeRecord] = []
+        for c in candidates:
+            if not c.is_schedulable:
+                continue
+            if c.status not in ("online", "probation"):
+                continue
+            if c.drain_status not in ("none", "", None):
+                continue
+            if c.lifecycle_state not in ("online", "probation"):
+                continue
+            if c.provider_id in suspended_providers:
+                continue
+            if self.settings.environment == "production" and c.health_check_success_count < 1:
+                continue
+
+            # Probation capacity cap
+            if c.lifecycle_state == "probation":
+                if (c.probation_placed_bytes + required_bytes) > self.settings.probation_max_bytes:
+                    continue
+
+            # Safety buffer check: enforce only if total capacity of node exceeds the buffer
+            safety_buffer = self.settings.disk_safety_buffer_bytes
+            if c.total_capacity_bytes > (safety_buffer * 2):
+                if c.available_capacity_bytes < (required_bytes + safety_buffer):
+                    continue
+            else:
+                if c.available_capacity_bytes < required_bytes:
+                    continue
+
+            schedulable_candidates.append(c)
+
         if not schedulable_candidates:
             return None
 
         pref = preferred_connectivity.strip().upper() if preferred_connectivity else None
 
-        def selection_score(n: NodeRecord) -> tuple[int, int]:
+        # Ranking:
+        # Promoted online nodes (1) before probation nodes (0)
+        # Higher reliability score
+        # Preferred connectivity match
+        # Available capacity
+        def selection_score(n: NodeRecord) -> tuple[int, float, int, int]:
+            is_promoted = 1 if n.lifecycle_state == "online" else 0
             connectivity_match = 1 if (pref and n.connectivity_mode == pref) else 0
-            return (connectivity_match, n.available_capacity_bytes)
+            reliability = n.reliability_score
+            return (is_promoted, reliability, connectivity_match, n.available_capacity_bytes)
 
         schedulable_candidates.sort(key=selection_score, reverse=True)
         return schedulable_candidates[0]
+
+    def record_probation_placement(self, node_id: str, placed_bytes: int) -> NodeRecord:
+        """Records consumer chunk placement on a probation or online node."""
+        clean_node_id = node_id.strip()
+        with get_db_connection(self.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE nodes
+                SET probation_placed_bytes = probation_placed_bytes + ?,
+                    used_capacity_bytes = used_capacity_bytes + ?,
+                    available_capacity_bytes = MAX(0, available_capacity_bytes - ?)
+                WHERE node_id = ?
+                """,
+                (placed_bytes, placed_bytes, placed_bytes, clean_node_id),
+            )
+            conn.commit()
+        node = self.get_node(clean_node_id)
+        if not node:
+            raise NodeNotFoundError(f"Node '{clean_node_id}' not found.")
+        return node
 
     def delete_node(self, node_id: str) -> bool:
         """Deletes a node record from the registry."""
@@ -621,7 +759,7 @@ class NodeRegistry:
         clean_status = new_status.strip().lower()
         if clean_status not in VALID_STATUSES:
             raise ValueError(f"Invalid node status '{clean_status}'.")
-        sched = 0 if clean_status in ("disabled", "draining", "offline") else 1
+        sched = 0 if clean_status in ("disabled", "draining", "offline", "unhealthy", "registered", "validation_in_progress") else 1
         with get_db_connection(self.db_path) as conn:
             cursor = conn.execute(
                 "UPDATE nodes SET status = ?, is_schedulable = ? WHERE node_id = ?",
@@ -629,6 +767,8 @@ class NodeRegistry:
             )
             if cursor.rowcount == 0:
                 raise NodeNotFoundError(f"Node '{clean_node_id}' not found.")
+            if clean_status == "disabled":
+                conn.execute("UPDATE nodes SET lifecycle_state = 'disabled' WHERE node_id = ?", (clean_node_id,))
             conn.commit()
         node = self.get_node(clean_node_id)
         if not node:

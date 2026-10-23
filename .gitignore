@@ -4,6 +4,8 @@ storage/
 !**/storage/.gitkeep
 *.db
 *.sqlite3
+*.bak
+test_disposable_file.txt
 
 # Python & Virtual Environments
 __pycache__/

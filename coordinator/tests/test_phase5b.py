@@ -55,6 +55,7 @@ def phase5b_env(tmp_path):
     from coordinator.app.database import init_db
     init_db(coord_settings.db_path)
     
+    coord_app.state.settings = coord_settings
     coord_app.dependency_overrides[get_coord_settings] = lambda: coord_settings
     coord_tc = TestClient(coord_app)
     
@@ -86,6 +87,13 @@ def phase5b_env(tmp_path):
     yield coord_tc, nodes_info
 
     coord_app.dependency_overrides.clear()
+    for attr in ("settings", "account_manager", "catalog", "registry"):
+        if hasattr(coord_app.state, attr):
+            try:
+                delattr(coord_app.state, attr)
+            except Exception:
+                pass
+
 
 
 def test_unified_lifecycle_replication(phase5b_env, tmp_path):

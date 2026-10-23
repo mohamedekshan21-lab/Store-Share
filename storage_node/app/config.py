@@ -21,6 +21,16 @@ class Settings(BaseModel):
         default_factory=lambda: Path(os.getenv("STORAGE_ROOT", "./storage")).resolve()
     )
     
+    # Optional explicitly configured Node ID
+    node_id: Optional[str] = Field(
+        default_factory=lambda: os.getenv("NODE_ID", None)
+    )
+
+    # Optional explicitly configured Provider ID
+    provider_id: Optional[str] = Field(
+        default_factory=lambda: os.getenv("PROVIDER_ID", os.getenv("NODE_PROVIDER_ID", None))
+    )
+    
     # Configured storage quota in Gigabytes (GB)
     storage_quota_gb: float = Field(
         default_factory=lambda: float(os.getenv("STORAGE_QUOTA_GB", "10.0"))
@@ -39,6 +49,16 @@ class Settings(BaseModel):
     # Optional development authentication token
     auth_token: Optional[str] = Field(
         default_factory=lambda: os.getenv("AUTH_TOKEN", os.getenv("EXPO_AUTH_TOKEN", None))
+    )
+
+    # Dedicated HMAC-SHA-256 Capability Secret (Phase 10B)
+    capability_secret: Optional[str] = Field(
+        default_factory=lambda: os.getenv("CAPABILITY_SECRET", os.getenv("NODE_CAPABILITY_SECRET", None))
+    )
+
+    # Environment: 'development', 'testing', or 'production'
+    environment: str = Field(
+        default_factory=lambda: os.getenv("EXPO_ENV", os.getenv("NODE_ENV", "development")).lower()
     )
 
     # Coordinator integration settings (Phase 2A & 2B)
@@ -117,6 +137,15 @@ class Settings(BaseModel):
     def storage_quota_bytes(self) -> int:
         """Returns the storage quota in bytes."""
         return int(self.storage_quota_gb * 1024 * 1024 * 1024)
+
+    @property
+    def effective_capability_secret(self) -> Optional[str]:
+        """Resolves capability signing secret, providing secure dev fallback in non-production."""
+        if self.capability_secret and self.capability_secret.strip():
+            return self.capability_secret.strip()
+        if self.environment != "production":
+            return "expo-dev-capability-secret-shared-key-2026!"
+        return None
 
     def resolve_sandbox_path(self) -> Path:
         """Ensure storage_root is fully resolved and created."""

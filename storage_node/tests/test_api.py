@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from storage_node.app.config import Settings
-from storage_node.app.main import app, get_manager
+from storage_node.app.main import app, get_manager, get_app_settings
 from storage_node.app.storage_manager import StorageManager
 
 
@@ -25,7 +25,9 @@ def test_settings(tmp_path: Path) -> Settings:
 @pytest.fixture
 def client(test_settings: Settings) -> TestClient:
     manager = StorageManager(test_settings)
+    app.state.settings = test_settings
     app.dependency_overrides[get_manager] = lambda: manager
+    app.dependency_overrides[get_app_settings] = lambda: test_settings
     client = TestClient(app)
     yield client
     app.dependency_overrides.clear()

@@ -1,0 +1,18 @@
+{
+  "name": "expo-distributed-storage-frontend",
+  "version": "1.0.0",
+  "description": "Expo Distributed Storage Web Dashboard Frontend Application",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": [
+    "expo",
+    "distributed-storage",
+    "dashboard",
+    "frontend"
+  ],
+  "author": "Expo Distributed Storage Team",
+  "license": "MIT"
+}

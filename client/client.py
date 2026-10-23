@@ -220,11 +220,13 @@ class ExpoClient:
         except httpx.HTTPError as exc:
             raise ClientError(f"Upload network error: {str(exc)}") from exc
 
-    def upload_chunk_bytes(self, chunk_bytes: bytes, filename: str) -> Dict[str, Any]:
+    def upload_chunk_bytes(self, chunk_bytes: bytes, filename: str, capability_token: Optional[str] = None) -> Dict[str, Any]:
         """Uploads raw binary chunk payload to remote Storage Node as an opaque object."""
         local_sha256 = compute_sha256(chunk_bytes)
         headers = self._get_headers()
         headers["X-SHA256-Checksum"] = local_sha256
+        if capability_token and capability_token.strip():
+            headers["X-Capability-Token"] = capability_token.strip()
         timeout = httpx.Timeout(self.timeout, connect=min(10.0, self.timeout))
 
         url = f"{self.base_url}/files"
@@ -254,16 +256,19 @@ class ExpoClient:
         except httpx.HTTPError as exc:
             raise ClientError(f"Chunk upload network error: {str(exc)}") from exc
 
-    def download_chunk_bytes(self, file_id: str, max_retries: int = 1) -> bytes:
+    def download_chunk_bytes(self, file_id: str, max_retries: int = 1, capability_token: Optional[str] = None) -> bytes:
         """Downloads raw chunk bytes from remote Storage Node and verifies SHA-256 checksum with bounded retries."""
         url = f"{self.base_url}/files/{file_id}"
+        headers = self._get_headers()
+        if capability_token and capability_token.strip():
+            headers["X-Capability-Token"] = capability_token.strip()
         timeout = httpx.Timeout(self.timeout, connect=min(10.0, self.timeout))
 
         last_error: Optional[Exception] = None
         for attempt in range(max_retries + 1):
             try:
                 with httpx.Client(timeout=timeout) as client:
-                    res = client.get(url, headers=self._get_headers())
+                    res = client.get(url, headers=headers)
                     if res.status_code == 401:
                         raise ClientError("Authentication failed: Missing or invalid node auth token.")
                     elif res.status_code == 404:
@@ -358,11 +363,14 @@ class ExpoClient:
                 out_path.unlink(missing_ok=True)
             raise ClientError(f"Download network error: {str(exc)}") from exc
 
-    def delete_file(self, file_id: str) -> bool:
+    def delete_file(self, file_id: str, capability_token: Optional[str] = None) -> bool:
         """Deletes file on remote node."""
         url = f"{self.base_url}/files/{file_id}"
+        headers = self._get_headers()
+        if capability_token and capability_token.strip():
+            headers["X-Capability-Token"] = capability_token.strip()
         try:
-            res = httpx.delete(url, headers=self._get_headers(), timeout=self.timeout)
+            res = httpx.delete(url, headers=headers, timeout=self.timeout)
             if res.status_code == 404:
                 raise ClientError(f"Remote file not found (404): ID '{file_id}'")
             elif res.status_code == 401:
@@ -542,6 +550,35 @@ class ExpoClient:
                 chunks_tuples, selected_nodes, replication_factor=replication_factor
             )
 
+            # Phase 10B: Request signed upload capabilities from Coordinator if available
+            upload_caps: Dict[str, Dict[str, str]] = {}
+            if coordinator_url:
+                try:
+                    cap_payload = {
+                        "file_id": file_id,
+                        "chunks": [
+                            {
+                                "chunk_id": c_id,
+                                "node_ids": [p[0] for p in placements],
+                                "size": len(c_bytes),
+                                "sha256": c_sha256,
+                            }
+                            for _, c_id, c_bytes, c_sha256, placements in chunk_assignments
+                        ]
+                    }
+                    cap_headers = self._get_headers()
+                    with httpx.Client(timeout=self.timeout) as cc:
+                        cap_res = cc.post(f"{coordinator_url}/catalog/capabilities/upload", json=cap_payload, headers=cap_headers)
+                        if cap_res.status_code == 200:
+                            upload_caps = cap_res.json().get("capabilities", {})
+                        elif cap_res.status_code in (400, 401, 403, 507):
+                            detail = cap_res.json().get("detail", cap_res.text) if cap_res.content else cap_res.text
+                            raise ClientError(f"Upload capability request rejected ({cap_res.status_code}): {detail}")
+                except ClientError:
+                    raise
+                except Exception:
+                    pass
+
             manifest_chunks: List[ChunkMetadata] = []
             uploaded_records: List[Tuple[ExpoClient, str]] = []
 
@@ -559,7 +596,14 @@ class ExpoClient:
                             node_client = self.get_node_client(n_id, endpoint=ep, coordinator_url=coordinator_url)
 
                         opaque_filename = f"{c_id}.dat"
-                        upload_meta = node_client.upload_chunk_bytes(c_bytes, opaque_filename)
+                        node_cap = upload_caps.get(c_id, {}).get(n_id)
+                        if node_cap:
+                            try:
+                                upload_meta = node_client.upload_chunk_bytes(c_bytes, opaque_filename, capability_token=node_cap)
+                            except TypeError:
+                                upload_meta = node_client.upload_chunk_bytes(c_bytes, opaque_filename)
+                        else:
+                            upload_meta = node_client.upload_chunk_bytes(c_bytes, opaque_filename)
                         stored_file_id = upload_meta.get("file_id", c_id)
 
 
@@ -683,6 +727,36 @@ class ExpoClient:
 
         shard_assignments = assign_shards_for_erasure_coding(encoded_chunks, selected_nodes, data_shards=k, parity_shards=m)
 
+        # Phase 10B: Request signed upload capabilities for shards from Coordinator
+        upload_caps: Dict[str, Dict[str, str]] = {}
+        if coordinator_url:
+            try:
+                cap_payload = {
+                    "file_id": file_id,
+                    "chunks": [
+                        {
+                            "chunk_id": shard.shard_id,
+                            "node_ids": [n_id],
+                            "size": len(shard.payload),
+                            "sha256": shard.sha256,
+                        }
+                        for _, _, shard_placements, _, _, _ in shard_assignments
+                        for shard, n_id, _ in shard_placements
+                    ]
+                }
+                cap_headers = self._get_headers()
+                with httpx.Client(timeout=self.timeout) as cc:
+                    cap_res = cc.post(f"{coordinator_url}/catalog/capabilities/upload", json=cap_payload, headers=cap_headers)
+                    if cap_res.status_code == 200:
+                        upload_caps = cap_res.json().get("capabilities", {})
+                    elif cap_res.status_code in (400, 401, 403, 507):
+                        detail = cap_res.json().get("detail", cap_res.text) if cap_res.content else cap_res.text
+                        raise ClientError(f"Upload capability request rejected ({cap_res.status_code}): {detail}")
+            except ClientError:
+                raise
+            except Exception:
+                pass
+
         manifest_chunks: List[ChunkMetadata] = []
         uploaded_records: List[Tuple[ExpoClient, str]] = []
 
@@ -702,7 +776,14 @@ class ExpoClient:
                     if not opaque_filename.endswith(".dat"):
                         opaque_filename += ".dat"
                         
-                    upload_meta = node_client.upload_chunk_bytes(shard.payload, opaque_filename)
+                    shard_cap = upload_caps.get(shard.shard_id, {}).get(n_id)
+                    if shard_cap:
+                        try:
+                            upload_meta = node_client.upload_chunk_bytes(shard.payload, opaque_filename, capability_token=shard_cap)
+                        except TypeError:
+                            upload_meta = node_client.upload_chunk_bytes(shard.payload, opaque_filename)
+                    else:
+                        upload_meta = node_client.upload_chunk_bytes(shard.payload, opaque_filename)
                     stored_file_id = upload_meta.get("file_id", shard.shard_id)
 
                     uploaded_records.append((node_client, stored_file_id))
@@ -852,7 +933,14 @@ class ExpoClient:
 
                 try:
                     target_chunk_id = getattr(placement, "chunk_id", None) or chunk_meta.chunk_id
-                    chunk_bytes = node_client.download_chunk_bytes(target_chunk_id)
+                    cap_token = getattr(placement, "capability", None)
+                    if cap_token:
+                        try:
+                            chunk_bytes = node_client.download_chunk_bytes(target_chunk_id, capability_token=cap_token)
+                        except TypeError:
+                            chunk_bytes = node_client.download_chunk_bytes(target_chunk_id)
+                    else:
+                        chunk_bytes = node_client.download_chunk_bytes(target_chunk_id)
                     computed_hash = compute_sha256(chunk_bytes)
                     if computed_hash != chunk_meta.sha256.lower():
                         attempt_logs.append(
@@ -953,7 +1041,14 @@ class ExpoClient:
 
 
                 try:
-                    shard_bytes = node_client.download_chunk_bytes(shard_meta.shard_id)
+                    cap_token = getattr(shard_meta, "capability", None)
+                    if cap_token:
+                        try:
+                            shard_bytes = node_client.download_chunk_bytes(shard_meta.shard_id, capability_token=cap_token)
+                        except TypeError:
+                            shard_bytes = node_client.download_chunk_bytes(shard_meta.shard_id)
+                    else:
+                        shard_bytes = node_client.download_chunk_bytes(shard_meta.shard_id)
                     computed_hash = compute_sha256(shard_bytes)
                     if computed_hash != shard_meta.shard_sha256.lower():
                         attempt_logs.append(
@@ -1169,20 +1264,40 @@ class ExpoClient:
     def delete_logical_file(
         self,
         file_id: str,
-        coordinator_url: str = "http://127.0.0.1:9000"
+        coordinator_url: str = "http://127.0.0.1:9000",
+        sync_cleanup: bool = False,
     ) -> Dict[str, Any]:
         """Unified deletion: Delegates durable physical cleanup to Coordinator deletion jobs."""
         from coordinator.coordinator_client import CoordinatorClient
         
         coord_client = CoordinatorClient(coordinator_url=coordinator_url, auth_token=self.auth_token, timeout=self.timeout)
         
-        # 1. Transition to 'deleting' state idempotently. This spawns a background physical cleanup job on the Coordinator.
-        record = coord_client.delete_logical_file(file_id)
+        # 1. Transition to 'deleting' state idempotently. Spawns durable physical cleanup job on the Coordinator.
+        record = coord_client.delete_logical_file(file_id, sync_cleanup=sync_cleanup)
         
         return {
-            "status": "deleting",
+            "status": record.get("status", "deleting"),
             "file_id": file_id,
             "physical_success_count": 0,
             "physical_failure_count": 0,
             "catalog_record": record
         }
+
+    def get_file_storage_status(
+        self,
+        file_id: str,
+        coordinator_url: str = "http://127.0.0.1:9000",
+    ) -> Dict[str, Any]:
+        """Queries physical storage health, degradation status, and placement health for a logical file."""
+        from coordinator.coordinator_client import CoordinatorClient
+        coord_client = CoordinatorClient(coordinator_url=coordinator_url, auth_token=self.auth_token, timeout=self.timeout)
+        return coord_client.get_file_status(file_id)
+
+    def get_quota(
+        self,
+        coordinator_url: str = "http://127.0.0.1:9000",
+    ) -> Dict[str, Any]:
+        """Queries account storage limits, committed usage, in-flight reservations, and available quota."""
+        from coordinator.coordinator_client import CoordinatorClient
+        coord_client = CoordinatorClient(coordinator_url=coordinator_url, auth_token=self.auth_token, timeout=self.timeout)
+        return coord_client.get_quota()

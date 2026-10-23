@@ -5,8 +5,12 @@ Provides node registry database schema initialization and migrations for Interne
 
 from __future__ import annotations
 
+import json
 import sqlite3
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def get_db_connection(db_path: Path) -> sqlite3.Connection:
@@ -53,6 +57,31 @@ def init_db(db_path: Path) -> None:
             conn.execute("ALTER TABLE nodes ADD COLUMN is_schedulable INTEGER DEFAULT 1")
         if "drain_status" not in existing_columns:
             conn.execute("ALTER TABLE nodes ADD COLUMN drain_status TEXT DEFAULT 'none'")
+
+        # Phase 10C: Node Lifecycle, Probation, Validation & Reliability columns
+        if "lifecycle_state" not in existing_columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN lifecycle_state TEXT DEFAULT 'registered'")
+            conn.execute("UPDATE nodes SET lifecycle_state = 'online' WHERE status = 'online'")
+        if "probation_started_at" not in existing_columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN probation_started_at TEXT")
+        if "promoted_at" not in existing_columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN promoted_at TEXT")
+        if "health_check_success_count" not in existing_columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN health_check_success_count INTEGER DEFAULT 0")
+        if "health_check_fail_count" not in existing_columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN health_check_fail_count INTEGER DEFAULT 0")
+        if "consecutive_failures" not in existing_columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN consecutive_failures INTEGER DEFAULT 0")
+        if "last_health_check_at" not in existing_columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN last_health_check_at TEXT")
+        if "last_health_check_status" not in existing_columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN last_health_check_status TEXT")
+        if "last_health_check_error" not in existing_columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN last_health_check_error TEXT")
+        if "reliability_score" not in existing_columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN reliability_score REAL DEFAULT 0.0")
+        if "probation_placed_bytes" not in existing_columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN probation_placed_bytes INTEGER DEFAULT 0")
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_provider ON nodes (provider_id)")
 
@@ -407,5 +436,324 @@ def init_db(db_path: Path) -> None:
             "CREATE INDEX IF NOT EXISTS idx_mig_chunk ON node_drain_migrations (file_id, chunk_id, shard_index)"
         )
 
+        # Phase 10A: Distinct Account Identities, Roles & Sessions
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS accounts (
+                account_id TEXT PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'consumer',
+                capabilities TEXT NOT NULL DEFAULT 'consumer',
+                status TEXT NOT NULL DEFAULT 'active',
+                provider_id TEXT,
+                email_verified INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts (email)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_provider ON accounts (provider_id)")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS account_sessions (
+                session_hash TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                email TEXT NOT NULL,
+                role TEXT NOT NULL,
+                provider_id TEXT,
+                csrf_token TEXT NOT NULL,
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                last_accessed_at TEXT NOT NULL,
+                FOREIGN KEY (account_id) REFERENCES accounts(account_id)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_acc_sess_account ON account_sessions (account_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_acc_sess_expires ON account_sessions (expires_at)")
+
+        # Phase 10A migrations: link account_id on provider_credentials and provider_sessions if missing
+        cursor_pc = conn.execute("PRAGMA table_info(provider_credentials)")
+        pc_cols = [row["name"] for row in cursor_pc.fetchall()]
+        if "account_id" not in pc_cols:
+            conn.execute("ALTER TABLE provider_credentials ADD COLUMN account_id TEXT")
+
+        cursor_ps = conn.execute("PRAGMA table_info(provider_sessions)")
+        ps_cols = [row["name"] for row in cursor_ps.fetchall()]
+        if "account_id" not in ps_cols:
+            conn.execute("ALTER TABLE provider_sessions ADD COLUMN account_id TEXT")
+
+        # Phase 10C: Provider Onboarding Consent and Status Table
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS provider_onboarding (
+                provider_id TEXT PRIMARY KEY,
+                account_id TEXT,
+                terms_version TEXT NOT NULL,
+                terms_accepted_at TEXT NOT NULL,
+                accepted_at TEXT,
+                is_verified INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_onboard_account ON provider_onboarding (account_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_onboard_status ON provider_onboarding (status)")
+
+        cursor_po = conn.execute("PRAGMA table_info(provider_onboarding)")
+        po_cols = [row["name"] for row in cursor_po.fetchall()]
+        if "accepted_at" not in po_cols:
+            conn.execute("ALTER TABLE provider_onboarding ADD COLUMN accepted_at TEXT")
+        if "terms_accepted_at" not in po_cols:
+            conn.execute("ALTER TABLE provider_onboarding ADD COLUMN terms_accepted_at TEXT")
+        if "is_verified" not in po_cols:
+            conn.execute("ALTER TABLE provider_onboarding ADD COLUMN is_verified INTEGER NOT NULL DEFAULT 1")
+
+        # Phase 10C: Node Validation Audit Records Table
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS node_validation_records (
+                validation_id TEXT PRIMARY KEY,
+                node_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                checks_performed TEXT NOT NULL,
+                details_json TEXT,
+                failure_reason TEXT,
+                performed_at TEXT NOT NULL,
+                duration_ms REAL,
+                FOREIGN KEY (node_id) REFERENCES nodes(node_id)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_val_node ON node_validation_records (node_id, performed_at)")
+
+        # Phase 10D: Account Storage Quotas and Upload Reservations
+        cursor_acc = conn.execute("PRAGMA table_info(accounts)")
+        acc_cols = [row["name"] for row in cursor_acc.fetchall()]
+        if "quota_bytes" not in acc_cols:
+            conn.execute("ALTER TABLE accounts ADD COLUMN quota_bytes INTEGER NOT NULL DEFAULT 10737418240")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS account_quota_reservations (
+                reservation_id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                file_id TEXT,
+                reserved_bytes INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active'
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_quota_res_account ON account_quota_reservations (account_id, status, expires_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_quota_res_file ON account_quota_reservations (file_id)")
+
+        # Phase 10E: Email/SMS Verification, Password Reset Tokens & Rate Limits
+        if "email_verified_at" not in acc_cols:
+            conn.execute("ALTER TABLE accounts ADD COLUMN email_verified_at TEXT")
+        if "phone_number" not in acc_cols:
+            conn.execute("ALTER TABLE accounts ADD COLUMN phone_number TEXT")
+        if "phone_verified" not in acc_cols:
+            conn.execute("ALTER TABLE accounts ADD COLUMN phone_verified INTEGER NOT NULL DEFAULT 0")
+        if "phone_verified_at" not in acc_cols:
+            conn.execute("ALTER TABLE accounts ADD COLUMN phone_verified_at TEXT")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS account_verification_tokens (
+                token_hash TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                target TEXT NOT NULL,
+                token_type TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_at TEXT,
+                created_at TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 5,
+                last_attempt_at TEXT,
+                ip_address TEXT,
+                FOREIGN KEY (account_id) REFERENCES accounts(account_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tok_acc_type ON account_verification_tokens (account_id, token_type, used_at, expires_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tok_target_type ON account_verification_tokens (target, token_type)"
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS verification_rate_limits (
+                limit_id TEXT PRIMARY KEY,
+                identifier TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                attempted_at TEXT NOT NULL,
+                ip_address TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vrl_ident_action ON verification_rate_limits (identifier, action_type, attempted_at)"
+        )
+
+        # Phase 10F: Administrative Audit Log & Observability
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin_audit_log (
+                audit_id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                admin_account_id TEXT NOT NULL,
+                admin_email TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                details_json TEXT,
+                ip_address TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON admin_audit_log (timestamp DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_admin ON admin_audit_log (admin_account_id, timestamp DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_target ON admin_audit_log (target_type, target_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts (status)"
+        )
+
         conn.commit()
 
+
+def record_audit_event(
+    db_path: Path,
+    admin_account_id: str,
+    admin_email: str,
+    action: str,
+    target_type: str,
+    target_id: str,
+    details: Optional[Dict[str, Any]] = None,
+    ip_address: Optional[str] = None,
+) -> str:
+    """Records an administrative action in the durable audit log (Phase 10F)."""
+    audit_id = str(uuid.uuid4())
+    now_str = datetime.now(timezone.utc).isoformat()
+    details_str = json.dumps(details) if details else None
+    with get_db_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO admin_audit_log (
+                audit_id, timestamp, admin_account_id, admin_email,
+                action, target_type, target_id, details_json, ip_address
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                audit_id,
+                now_str,
+                admin_account_id,
+                admin_email,
+                action,
+                target_type,
+                target_id,
+                details_str,
+                ip_address,
+            ),
+        )
+        conn.commit()
+    return audit_id
+
+
+def get_audit_events(
+    db_path: Path,
+    limit: int = 50,
+    offset: int = 0,
+    action: Optional[str] = None,
+    admin_id: Optional[str] = None,
+) -> Tuple[int, List[Dict[str, Any]]]:
+    """Retrieves paginated and bounded audit events from the audit log (Phase 10F)."""
+    safe_limit = max(1, min(100, int(limit)))
+    safe_offset = max(0, int(offset))
+
+    where_clauses = []
+    params: List[Any] = []
+
+    if action and action.strip():
+        where_clauses.append("action = ?")
+        params.append(action.strip())
+
+    if admin_id and admin_id.strip():
+        where_clauses.append("(admin_account_id = ? OR admin_email = ?)")
+        params.extend([admin_id.strip(), admin_id.strip()])
+
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    with get_db_connection(db_path) as conn:
+        count_cursor = conn.execute(
+            f"SELECT COUNT(*) AS total FROM admin_audit_log {where_sql}",
+            params,
+        )
+        total = count_cursor.fetchone()["total"]
+
+        query_sql = f"""
+            SELECT * FROM admin_audit_log
+            {where_sql}
+            ORDER BY timestamp DESC
+            LIMIT ? OFFSET ?
+        """
+        rows = conn.execute(query_sql, params + [safe_limit, safe_offset]).fetchall()
+
+        events = []
+        for r in rows:
+            parsed_details = None
+            if r["details_json"]:
+                try:
+                    parsed_details = json.loads(r["details_json"])
+                except Exception:
+                    parsed_details = {"raw": r["details_json"]}
+            events.append(
+                {
+                    "audit_id": r["audit_id"],
+                    "timestamp": r["timestamp"],
+                    "admin_account_id": r["admin_account_id"],
+                    "admin_email": r["admin_email"],
+                    "action": r["action"],
+                    "target_type": r["target_type"],
+                    "target_id": r["target_id"],
+                    "details": parsed_details,
+                    "ip_address": r["ip_address"],
+                }
+            )
+
+        return total, events
+
+
+def reassign_legacy_file_ownership(db_path: Path, legacy_owner_id: str, target_account_id: str) -> int:
+    """
+    Safely reassigns logical files from a legacy owner_id (e.g. a shared development token)
+    to a verified target account UUID. Preserves all manifests, encryption keys, and chunk records.
+    Returns the count of reassigned files.
+    """
+    if not legacy_owner_id or not target_account_id:
+        raise ValueError("Both legacy_owner_id and target_account_id must be non-empty strings.")
+
+    now_str = datetime.now(timezone.utc).isoformat()
+    with get_db_connection(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE files SET owner_id = ?, updated_at = ? WHERE owner_id = ?",
+            (target_account_id.strip(), now_str, legacy_owner_id.strip())
+        )
+        conn.commit()
+        return cursor.rowcount

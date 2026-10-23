@@ -32,6 +32,8 @@ class NodeRegisterRequest(BaseModel):
     physical_free_bytes: Optional[int] = Field(None, description="Physical host disk free capacity in bytes")
     provider_id: Optional[str] = Field("default_provider", description="Provider account/owner identity")
     is_schedulable: Optional[bool] = Field(True, description="Whether node accepts new chunk allocations")
+    lifecycle_state: Optional[str] = Field(None, description="Optional initial lifecycle state ('registered', 'probation', 'online')")
+    status: Optional[str] = Field(None, description="Optional initial operational status")
 
 
 class NodeHeartbeatRequest(BaseModel):
@@ -58,7 +60,7 @@ class NodeRecord(BaseModel):
     port: int = Field(..., description="Storage Node listening port")
     endpoint: str = Field(..., description="Full endpoint URL for access")
     advertised_endpoint: Optional[str] = Field(None, description="Publicly advertised endpoint URL")
-    status: str = Field(..., description="Operational status ('online', 'offline', 'connecting', 'degraded')")
+    status: str = Field(..., description="Operational status ('registered', 'validation_in_progress', 'probation', 'online', 'unhealthy', 'offline', 'disabled', 'draining', 'drained')")
     connectivity_mode: str = Field(default="LAN", description="Connectivity mode ('LAN', 'DIRECT', 'RELAY', 'UNKNOWN')")
     protocol_version: str = Field(default="2B", description="Protocol version string")
     total_capacity_bytes: int = Field(..., description="Total storage capacity in bytes")
@@ -69,6 +71,17 @@ class NodeRecord(BaseModel):
     provider_id: Optional[str] = Field("default_provider", description="Provider account/owner identity")
     is_schedulable: Optional[bool] = Field(True, description="Whether node accepts new chunk allocations")
     drain_status: Optional[str] = Field("none", description="Durable drain status ('none', 'draining', 'drain_blocked', 'drained', 'decommissioned')")
+    lifecycle_state: str = Field(default="registered", description="Durable node lifecycle state ('registered', 'validation_in_progress', 'probation', 'online', 'unhealthy', 'disabled', 'draining', 'drained')")
+    probation_started_at: Optional[str] = Field(None, description="ISO timestamp when node entered probation")
+    promoted_at: Optional[str] = Field(None, description="ISO timestamp when node was promoted to online")
+    health_check_success_count: int = Field(default=0, description="Count of successful validation and health checks")
+    health_check_fail_count: int = Field(default=0, description="Count of failed validation and health checks")
+    consecutive_failures: int = Field(default=0, description="Consecutive health check failures")
+    last_health_check_at: Optional[str] = Field(None, description="ISO timestamp of last health check")
+    last_health_check_status: Optional[str] = Field(None, description="Status of last health check ('success', 'failed', 'cleanup_failed')")
+    last_health_check_error: Optional[str] = Field(None, description="Error message from last health check if failed")
+    reliability_score: float = Field(default=0.0, description="Calculated reliability score in [0.0, 1.0]")
+    probation_placed_bytes: int = Field(default=0, description="Bytes placed on this node during probation period")
 
 
 class NodeListResponse(BaseModel):
@@ -663,6 +676,401 @@ class DrainWorkerStatusResponse(BaseModel):
     blocked_migrations: int = 0
 
 
+# =============================================================================
+# Phase 10A: Account Authentication, Roles & Multi-Tenant Identity Models
+# =============================================================================
+
+class RegisterAccountRequest(BaseModel):
+    """Payload to register a new user account."""
+    email: str = Field(..., description="User's email address")
+    password: str = Field(..., min_length=8, description="User password (min 8 chars)")
+    role: Optional[str] = Field("consumer", description="Account role: consumer or provider")
+    provider_id: Optional[str] = Field(None, description="Optional provider identifier if acting as storage provider")
+
+
+class LoginAccountRequest(BaseModel):
+    """Payload to authenticate an account."""
+    email: str = Field(..., description="Registered email address")
+    password: str = Field(..., description="Account password")
+
+
+class AccountResponse(BaseModel):
+    """Safe public representation of a user account."""
+    account_id: str
+    email: str
+    role: str
+    capabilities: List[str]
+    status: str
+    provider_id: Optional[str] = None
+    email_verified: bool
+    email_verified_at: Optional[str] = None
+    phone_number: Optional[str] = None
+    phone_verified: bool = False
+    phone_verified_at: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class LoginSuccessResponse(BaseModel):
+    """Response payload returned upon successful account login."""
+    account: AccountResponse
+    token: str
+    csrf_token: str
+    expires_at: str
+
+
+# =============================================================================
+# Phase 10B: Chunk Capability Authorization Models
+# =============================================================================
+
+class UploadCapabilityChunkItem(BaseModel):
+    """Specification of a chunk requiring upload authorization."""
+    chunk_id: str = Field(..., description="Chunk or shard identifier")
+    node_ids: List[str] = Field(..., description="Target node IDs allocated for this chunk")
+    size: Optional[int] = Field(None, description="Expected chunk size in bytes")
+    sha256: Optional[str] = Field(None, description="Expected chunk SHA-256 digest")
+
+
+class RequestUploadCapabilitiesRequest(BaseModel):
+    """Request payload to authorize chunk uploads."""
+    file_id: Optional[str] = Field(None, description="Logical file ID")
+    chunks: List[UploadCapabilityChunkItem] = Field(..., description="List of chunks to authorize")
+    original_size: Optional[int] = Field(None, description="Optional logical file size in bytes for quota reservation")
+
+
+class RequestUploadCapabilitiesResponse(BaseModel):
+    """Response returning signed upload capability tokens for each chunk and node."""
+    capabilities: Dict[str, Dict[str, str]] = Field(
+        ...,
+        description="Mapping of chunk_id -> {node_id: capability_token}"
+    )
+
+
+class RequestDownloadCapabilitiesRequest(BaseModel):
+    """Request payload to obtain download capabilities for an existing owned file."""
+    file_id: str = Field(..., description="Logical file ID")
+    chunk_ids: Optional[List[str]] = Field(None, description="Optional specific chunk IDs to authorize (all if None)")
+
+
+class RequestDownloadCapabilitiesResponse(BaseModel):
+    """Response returning signed download capability tokens for each chunk and placement."""
+    file_id: str
+    capabilities: Dict[str, Dict[str, str]] = Field(
+        ...,
+        description="Mapping of chunk_id -> {node_id: capability_token}"
+    )
+
+
+# =============================================================================
+# Phase 10C: Provider Onboarding, Validation & Reliability Gating Models
+# =============================================================================
+
+class ProviderOnboardRequest(BaseModel):
+    """Request payload to activate provider capabilities and accept terms."""
+    terms_version: Optional[str] = Field(None, description="Terms of service version identifier")
+    accept_terms: bool = Field(..., description="Must explicitly be True to record provider consent")
+    provider_id: Optional[str] = Field(None, description="Optional custom provider identifier")
+
+
+class ProviderOnboardResponse(BaseModel):
+    """Response returned upon successful provider onboarding."""
+    account_id: Optional[str] = None
+    provider_id: str
+    terms_version: str
+    terms_accepted_at: Optional[str] = None
+    accepted_at: Optional[str] = None
+    is_verified: bool = Field(default=True)
+    status: str
+    message: str
+
+
+class NodeValidationCheckItem(BaseModel):
+    """Individual diagnostic check result within a node validation run."""
+    name: str
+    passed: bool
+    message: Optional[str] = None
+    duration_ms: Optional[float] = None
+
+
+class NodeValidationResponse(BaseModel):
+    """Result of a storage node health validation run."""
+    validation_id: str
+    node_id: str
+    provider_id: str
+    status: str
+    lifecycle_state: str
+    overall_status: Optional[str] = None
+    resulting_lifecycle_state: Optional[str] = None
+    checks: List[NodeValidationCheckItem] = Field(default_factory=list)
+    failure_reason: Optional[str] = None
+    reliability_score: Optional[float] = 0.0
+    performed_at: str
+    duration_ms: float
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.overall_status is None:
+            self.overall_status = self.status
+        if self.resulting_lifecycle_state is None:
+            self.resulting_lifecycle_state = self.lifecycle_state
+
+
+class NodeProbationStatusResponse(BaseModel):
+    """Detailed probation progress and placement eligibility for a node."""
+    node_id: str
+    provider_id: str
+    lifecycle_state: str
+    status: str
+    is_schedulable: bool
+    reliability_score: float
+    probation_started_at: Optional[str] = None
+    promoted_at: Optional[str] = None
+    health_check_success_count: int = 0
+    health_check_fail_count: int = 0
+    consecutive_failures: int = 0
+    probation_placed_bytes: int = 0
+    probation_max_bytes: int
+    observation_period_met: bool
+    health_checks_met: bool
+    promotion_eligible: bool
+    reason_blocked: Optional[str] = None
+
+
+class ProviderNodeValidationHistoryResponse(BaseModel):
+    """History of validation runs for a specific node."""
+    node_id: str
+    probation_status: Optional[NodeProbationStatusResponse] = None
+    validations: List[NodeValidationResponse] = Field(default_factory=list)
+    count: int = 0
+
+
+# =============================================================================
+# Phase 10D: Account Storage Quotas and Consumer File Management Models
+# =============================================================================
+
+class AccountQuotaResponse(BaseModel):
+    """Account storage quota limits and usage figures."""
+    account_id: str
+    quota_bytes: int
+    used_bytes: int
+    reserved_bytes: int
+    available_bytes: int
+    file_count: int
+    policy: str
+
+
+class ReserveQuotaRequest(BaseModel):
+    """Request to explicitly reserve storage quota before uploading."""
+    expected_bytes: int
+    file_id: Optional[str] = None
+    ttl_seconds: Optional[int] = None
+
+
+class ReserveQuotaResponse(BaseModel):
+    """Response returned upon successful quota reservation."""
+    reservation_id: str
+    account_id: str
+    reserved_bytes: int
+    expires_at: str
+    status: str
+
+
+class ReleaseQuotaRequest(BaseModel):
+    """Request to release an active upload quota reservation."""
+    reservation_id: Optional[str] = None
+    file_id: Optional[str] = None
+
+
+class ReleaseQuotaResponse(BaseModel):
+    """Response returned upon releasing a reservation."""
+    status: str
+    released_count: int
+
+
+class UpdateAccountQuotaRequest(BaseModel):
+    """Administrative request to change an account's quota limit."""
+    quota_bytes: int = Field(..., ge=0, description="New quota limit in bytes")
+
+
+class UpdateAccountQuotaResponse(BaseModel):
+    """Response upon updating an account's quota."""
+    account_id: str
+    quota_bytes: int
+    message: str
+
+
+class FileStorageStatusResponse(BaseModel):
+    """Storage health and status report for a logical file."""
+    file_id: str
+    owner_id: str
+    original_filename: str
+    original_size: int
+    status: str
+    redundancy_mode: str
+    total_chunks: int
+    total_placements_or_shards: int
+    available_nodes_count: int
+    health: str
+    details: Dict[str, Any]
+    created_at: str
+    updated_at: str
+
+
+# =============================================================================
+# Phase 10E: Email/SMS Verification & Account Recovery Models
+# =============================================================================
+
+class VerifyEmailRequest(BaseModel):
+    """Payload to redeem an email verification token."""
+    token: str = Field(..., min_length=16, description="Cryptographically secure email verification token")
+
+
+class VerifyEmailResponse(BaseModel):
+    """Response returned upon successful email verification."""
+    detail: str
+    email_verified: bool
+    email: Optional[str] = None
+    account_id: Optional[str] = None
+
+
+class ResendVerificationRequest(BaseModel):
+    """Payload to request re-issuance of email verification link."""
+    email: str = Field(..., description="User account email address")
+
+
+class ForgotPasswordRequest(BaseModel):
+    """Payload to request a password reset email."""
+    email: str = Field(..., description="Registered account email address")
+
+
+class ResetPasswordRequest(BaseModel):
+    """Payload to confirm password reset using token."""
+    token: str = Field(..., min_length=16, description="Single-use password reset token")
+    new_password: str = Field(..., min_length=8, description="New account password (min 8 characters)")
+
+
+class SendSmsCodeRequest(BaseModel):
+    """Payload to request an SMS verification code."""
+    phone_number: str = Field(..., min_length=7, max_length=20, description="E.164 phone number (e.g. +1234567890)")
+
+
+class VerifySmsCodeRequest(BaseModel):
+    """Payload to verify an SMS code."""
+    phone_number: str = Field(..., min_length=7, max_length=20, description="E.164 phone number")
+    code: str = Field(..., min_length=6, max_length=6, description="6-digit verification code")
+
+
+class ActionStatusResponse(BaseModel):
+    """Generic action confirmation response."""
+    detail: str
+    success: bool = True
+
+
+# =============================================================================
+# Phase 10F: Admin APIs, Observability & Integrated UI Models
+# =============================================================================
+
+class AdminAccountListResponse(BaseModel):
+    """Paginated list of accounts for administrative review."""
+    total: int = Field(..., description="Total count of matching accounts")
+    limit: int = Field(..., description="Pagination limit applied")
+    offset: int = Field(..., description="Pagination offset applied")
+    accounts: List[AccountResponse] = Field(..., description="Sanitized account records")
+
+
+class AdminUpdateAccountStatusRequest(BaseModel):
+    """Payload to update an account's operational status under explicit policy."""
+    status: str = Field(..., description="New account status ('active', 'suspended', 'disabled')")
+    reason: str = Field(..., min_length=3, description="Justification for status change")
+
+
+class AdminDrainNodeRequest(BaseModel):
+    """Payload for administrator to initiate graceful node drain."""
+    reason: Optional[str] = Field("Admin-initiated drain", description="Administrative justification")
+
+
+class AdminNodeListResponse(BaseModel):
+    """Paginated list of storage nodes for administrative inspection."""
+    total: int = Field(..., description="Total count of matching nodes")
+    limit: int = Field(..., description="Pagination limit applied")
+    offset: int = Field(..., description="Pagination offset applied")
+    nodes: List[NodeRecord] = Field(..., description="Storage node records")
+
+
+class AdminStatsOverviewResponse(BaseModel):
+    """System-wide aggregate statistics across accounts, nodes, and storage."""
+    accounts: Dict[str, int] = Field(..., description="Account counts by status and role")
+    nodes: Dict[str, int] = Field(..., description="Storage node counts by status/lifecycle")
+    storage: Dict[str, Any] = Field(..., description="Capacity, usage, and catalog totals")
+    jobs: Dict[str, int] = Field(..., description="Operational background job counts")
+    timestamp: str = Field(..., description="Evaluation timestamp")
+
+
+class AdminAuditLogEntry(BaseModel):
+    """Audit log entry representing a sensitive administrative action."""
+    audit_id: str
+    timestamp: str
+    admin_account_id: str
+    admin_email: str
+    action: str
+    target_type: str
+    target_id: str
+    details: Optional[Dict[str, Any]] = None
+    ip_address: Optional[str] = None
+
+
+class AdminAuditLogListResponse(BaseModel):
+    """Paginated list of administrative audit logs."""
+    total: int
+    limit: int
+    offset: int
+    logs: List[AdminAuditLogEntry]
+
+
+class LivenessResponse(BaseModel):
+    """Coordinator service liveness health response."""
+    status: str = "online"
+    service: str = "coordinator"
+    timestamp: str
+
+
+class ReadinessResponse(BaseModel):
+    """Coordinator service dependency readiness response."""
+    status: str
+    checks: Dict[str, Any]
+    timestamp: str
+
+
+class ObservabilityMetricsResponse(BaseModel):
+    """Comprehensive coordinator operational metrics."""
+    requests: Dict[str, Any]
+    storage_nodes: Dict[str, int]
+    storage_bytes: Dict[str, Any]
+    quota: Dict[str, Any]
+    jobs: Dict[str, int]
+    active_sessions: int
+    timestamp: str
+
+
+class ConsumerFileItem(BaseModel):
+    """Logical file summary for the Consumer file manager UI."""
+    file_id: str
+    original_filename: str
+    original_size: int
+    status: str
+    redundancy_mode: str
+    chunk_count: int
+    created_at: str
+    updated_at: str
+
+
+class ConsumerFileListResponse(BaseModel):
+    """Consumer file list and quota overview."""
+    files: List[ConsumerFileItem]
+    total_files: int
+    total_bytes: int
+    quota_bytes: int
+    used_bytes: int
+    available_bytes: int
 
 
 

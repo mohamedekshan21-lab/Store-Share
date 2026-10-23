@@ -159,6 +159,16 @@ def main(argv: list[str] | None = None) -> int:
     ldel_parser.add_argument("file_id", help="Logical File ID")
     ldel_parser.add_argument("--coordinator-url", default="http://127.0.0.1:9000", help="Coordinator URL")
 
+    # Phase 10D: Quotas & File Status
+    # logical-inspect <file_id> [--coordinator-url <url>]
+    li_parser = subparsers.add_parser("logical-inspect", help="Retrieve file metadata and physical storage degradation status")
+    li_parser.add_argument("file_id", help="Logical File ID")
+    li_parser.add_argument("--coordinator-url", default="http://127.0.0.1:9000", help="Coordinator URL")
+
+    # quota-info [--coordinator-url <url>]
+    qi_parser = subparsers.add_parser("quota-info", help="Display consumer account storage quota, usage, and active reservations")
+    qi_parser.add_argument("--coordinator-url", default="http://127.0.0.1:9000", help="Coordinator URL")
+
     # Phase 7B: Credits, Reputation & Accounting
     # credits-balance <node_id> [--coordinator-url <url>]
     cb_parser = subparsers.add_parser("credits-balance", help="Display a storage node's current non-monetary ECC credit balance")
@@ -523,6 +533,32 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Logical Deletion Complete for {res['file_id']}!")
             print(f"Physical Cleanup : {res['physical_success_count']} succeeded, {res['physical_failure_count']} failed")
             print(f"Final Status     : {res['status']}")
+
+        # Phase 10D: File Inspection & Quotas
+        elif args.command == "logical-inspect":
+            res = client.get_file_storage_status(
+                file_id=args.file_id,
+                coordinator_url=args.coordinator_url
+            )
+            print(f"File Storage Status for '{res['file_id']}':")
+            print(f"Filename        : {res['original_filename']}")
+            print(f"Original Size   : {res['original_size']} bytes")
+            print(f"Catalog Status  : {res['status']}")
+            print(f"Redundancy Mode : {res['redundancy_mode']}")
+            print(f"Storage Health  : {res['health'].upper()}")
+            print(f"Chunks Count    : {res['total_chunks']}")
+            print(f"Placements/Shards: {res['available_nodes_count']} available / {res['total_placements_or_shards']} total")
+            print(f"Created At      : {res['created_at']}")
+
+        elif args.command == "quota-info":
+            res = client.get_quota(coordinator_url=args.coordinator_url)
+            print(f"Account Storage Quota for '{res['account_id']}':")
+            print(f"Configured Limit: {res['quota_bytes']} bytes")
+            print(f"Used Capacity   : {res['used_bytes']} bytes")
+            print(f"In-Flight Resv  : {res['reserved_bytes']} bytes")
+            print(f"Available Quota : {res['available_bytes']} bytes")
+            print(f"Active Files    : {res['file_count']}")
+            print(f"Accounting Model: {res['policy']}")
 
         # Phase 7B: Credits, Reputation & Accounting
         elif args.command == "credits-balance":
